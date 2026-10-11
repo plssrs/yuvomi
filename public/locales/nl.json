@@ -1136,7 +1136,7 @@
         "personalManagementHint": "Hier kun je je persoonlijke categorieën beheren. Alleen jij ziet ze; notities daarin zijn zichtbaar voor het hele huishouden. Huishoudcategorieën blijven beschikbaar in de notitie-editor, maar je hebt geen toestemming om ze te beheren."
     },
     "notes": {
-        "title": "Bord",
+        "title": "Notities",
         "newNote": "Nieuwe notitie",
         "editNote": "Notitie bewerken",
         "viewNote": "Notitie",
@@ -2027,7 +2027,7 @@
             "meals": "Maaltijden",
             "calendar": "Agenda",
             "schedule": "Dienstrooster",
-            "notes": "Bord",
+            "notes": "Notities",
             "contacts": "Contacten",
             "budget": "Budget",
             "documents": "Documenten",
