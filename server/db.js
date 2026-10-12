@@ -10656,6 +10656,97 @@ const MIGRATIONS = [
       ALTER TABLE calendar_pending_deletions ADD COLUMN etag TEXT;
     `,
   },
+  {
+    version: 241,
+    description: 'CalDAV: an upload is noted before it is sent, so a lost answer leaves a trace (#1882)',
+    // EIN UPLOAD, DESSEN ANTWORT VERLOREN GING, HINTERLIESS NICHTS. Der PUT kam
+    // an, das Objekt liegt auf dem Server, und lokal stand nur eine Zeile wie
+    // jede andere, die noch nie hinaufging. Wartet sie weiter auf denselben
+    // Platz, uebernimmt der naechste Lauf das Objekt (#1837). Wird sie aber
+    // vorher geloescht oder bekommt sie ein anderes Ziel, wusste niemand mehr,
+    // dass dort etwas von ihr liegt: der naechste Abruf holte den geloeschten
+    // Eintrag als neue Zeile zurueck bzw. legte neben die bestehende eine
+    // zweite.
+    //
+    // Die UID des Objekts allein darf das nicht entscheiden. Sie kommt vom
+    // Server, und wer dort schreiben darf, kann eine im Muster dieser
+    // Installation bauen (`server/utils/own-uid.js`); nach dem Einspielen
+    // eines aelteren Backups traegt ausserdem eine NEUE Zeile die Id einer
+    // frueheren, deren Objekt noch oben liegt. Geloescht wird ein Objekt
+    // deshalb nur, wenn der LOKALE Stand belegt, dass genau diese Zeile an
+    // genau diesen Platz hinaufgeschickt wurde.
+    //
+    // Dieser Beleg ist die Zeile hier: geschrieben VOR der Anfrage, entfernt,
+    // sobald ihr Ergebnis gebucht ist. Bleibt sie stehen, ist die Antwort nie
+    // angekommen. Sie ueberlebt die Zeile, von der sie handelt (kein
+    // Fremdschluessel auf calendar_events/tasks/shopping_items: drei Tabellen,
+    // und der Fall ist gerade der, in dem die Zeile fort ist); ihr Konto
+    // ueberlebt sie nicht - ohne Konto gibt es keinen Weg zum Objekt.
+    //
+    // `account_id` ist NULL fuer iCloud (eine Verbindung, kein Konto). Der
+    // Schluessel nennt den Platz: eine Zeile kann nacheinander an mehrere
+    // Plaetze geschickt worden sein, ohne dass eine Antwort ankam.
+    up: `
+      CREATE TABLE IF NOT EXISTS caldav_upload_attempts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        source         TEXT    NOT NULL CHECK (source IN ('caldav', 'apple')),
+        account_id     INTEGER REFERENCES caldav_accounts(id) ON DELETE CASCADE,
+        kind           TEXT    NOT NULL CHECK (kind IN ('event', 'task', 'item')),
+        row_id         INTEGER NOT NULL,
+        collection_url TEXT    NOT NULL,
+        uid            TEXT    NOT NULL,
+        object_url     TEXT    NOT NULL,
+        created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_caldav_upload_attempts_place
+        ON caldav_upload_attempts(source, COALESCE(account_id, 0), kind, row_id, collection_url);
+      CREATE INDEX IF NOT EXISTS idx_caldav_upload_attempts_uid
+        ON caldav_upload_attempts(uid);
+    `,
+  },
+  {
+    version: 242,
+    description: 'Tasks: manual order within a category (tasks.sort_order)',
+    // NULL = nie von Hand eingeordnet. Solche Aufgaben behalten die bisherige
+    // Reihenfolge (Faelligkeit, dann Prioritaet) und stehen HINTER den von Hand
+    // eingeordneten: eine neue Aufgabe landet damit am Ende ihrer Kategorie,
+    // statt eine bestehende Handordnung zu verschieben. Kein Backfill - bis zum
+    // ersten Zug aendert sich nichts an der Anzeige.
+    //
+    // Der Rang gilt in der Kategorie, in der er vergeben wurde: wechselt eine
+    // Aufgabe die Kategorie, setzt PUT /tasks/:id ihn auf NULL zurueck, und sie
+    // steht dort, wo jede neue Aufgabe steht. Die Folgeinstanz einer
+    // Wiederholung erbt den Rang ihrer Vorgaengerin. Gelesen wird er nur beim
+    // Gruppieren nach Kategorie.
+    up(db) {
+      const has = (table, column) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+      if (!has('tasks', 'sort_order')) db.exec('ALTER TABLE tasks ADD COLUMN sort_order INTEGER');
+    },
+  },
+  {
+    version: 243,
+    description: 'Shopping: a mirrored item waits to be carried to the list it was moved to',
+    // Ein gespiegelter Artikel, der auf eine andere gespiegelte Liste umzieht
+    // (#1700), nimmt sein Objekt auf dem CalDAV-Server mit. `outbound_move = 1`
+    // heisst: die Zeile steht schon auf der neuen Liste, ihr Objekt liegt noch
+    // in der Collection der alten (`external_object_url`) und soll in die
+    // Collection, die der Liste zugeordnet ist, in der die Zeile JETZT steht.
+    // Das Ziel steht deshalb nicht hier - es folgt aus `list_id`. Solange die
+    // Vormerkung steht, ordnet der Abruf die Zeile nicht nach dem Server um.
+    // `outbound_move_attempts` zaehlt die Absagen des Ziels; nach der fuenften
+    // faellt die Vormerkung, und die Zeile steht wieder auf der Liste ihres
+    // Objekts. Ein eigener Zaehler, weil `outbound_attempts` der Bearbeitung
+    // gehoert und mit ihr zurueckgesetzt wird.
+    up(db) {
+      const has = (column) => db.prepare('PRAGMA table_info(shopping_items)').all().some((c) => c.name === column);
+      if (!has('outbound_move')) {
+        db.exec('ALTER TABLE shopping_items ADD COLUMN outbound_move INTEGER NOT NULL DEFAULT 0');
+      }
+      if (!has('outbound_move_attempts')) {
+        db.exec('ALTER TABLE shopping_items ADD COLUMN outbound_move_attempts INTEGER NOT NULL DEFAULT 0');
+      }
+    },
+  },
 ];
 
 /**
@@ -10884,6 +10975,12 @@ const CRITICAL_COLUMNS = [
   // #1883: v240 traegt den ETag eines Loeschauftrags nach; ohne die Spalte
   // scheitert das Lesen der Auftraege und damit jeder ausgehende Durchgang.
   { table: 'calendar_pending_deletions', column: 'etag', type: 'TEXT' },
+  // #1700: v243 traegt die Vormerkung eines Umzugs zwischen gespiegelten
+  // Einkaufslisten nach; ohne die Spalten scheitert der Abruf jedes
+  // Einkaufsartikels (er liest sie, bevor er die Zeile anfasst) und jeder
+  // Sofortversuch.
+  { table: 'shopping_items', column: 'outbound_move', type: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'shopping_items', column: 'outbound_move_attempts', type: 'INTEGER NOT NULL DEFAULT 0' },
 ];
 
 /**

@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dates, the date field placeholder, short dates and typed input all follow it. Existing households
   keep the format they have set. A household that already has the Netherlands as its region gets
   the new format by setting "Region" to "Custom" and then "Preferred date format" to `DD-MM-YYYY`.
+- **Wall mode names today's tasks under each person** (#1817, from D#1604). "Who's up today"
+  used to show a face and a number. It now lists each person's open tasks for today by title, and
+  below them, dimmed and with a checkmark, what they have already done today - so a glance shows
+  what is left and what is finished. The wall still does not scroll: it shows as many lines as
+  the screen has room for and says "+2 more" for the rest. When space runs short, finished tasks
+  give way first. Someone who has finished everything keeps their ticked tasks until the next
+  day. Only tasks the whole household may see appear; a task set to "Assignees only" is not on
+  the wall, whoever is signed in on the device.
 - **A profile picture can be fetched from Gravatar once, if the operator turns it on.** Off by
   default: while `GRAVATAR_BASE_URL` is unset or empty nothing is sent and Settings → Account shows
   no button. An operator opts in by setting it to `https://gravatar.com/avatar/` or a Libravatar
@@ -31,8 +39,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. Only a SHA-256 hash of the address and the server's IP leave the server, through the
   SSRF-guarded client with an 8 second limit, a 512 KiB cap and a signature check. If the
   picture, the address or the account changes while the fetch runs, nothing is stored (409).
+  The hint and the error messages name the service the operator chose by its host name, so a
+  mirror is never called gravatar.com, and a failed fetch is announced once, in the form's error
+  line.
 - **Tapping a category or subcategory in the budget overview filters the transactions list.**
-  (#1593, from D#1583) The filter applies in place and can be cleared again.
+  (#1593, from D#1583) The filter applies in place and can be cleared again. A category with
+  both income and spending is marked in both blocks, because the list then shows both; keyboard
+  focus stays on the bar that was tapped and its ring is no longer cut off, and whether the tap
+  jumps to the list follows the width of the budget area, not of the window. The bars answer to
+  the pointer.
+- **The screensaver can show the time and fill the screen, chosen on each device** (#1766, from
+  D#885). Two switches under Settings → Account → Appearance, below the delay: the current time,
+  on unless switched off, in the household's time format and zone, turning on the full minute and
+  sitting in the corner opposite the photo caption, moving with it so no text stays in one place;
+  and photos that fill the whole screen instead of fitting inside it, off unless chosen, because it
+  crops portrait photos. Both are stored in the browser like wall mode and the delay, so the frame
+  in the hallway and the kitchen tablet decide for themselves, and both apply from the next start
+  of the screensaver without a reload.
+- **Tasks can be put in an order of your own within a category.** In the task list grouped by
+  category, every row has a grip: drag it, or press the arrow keys at the focused grip, and the
+  order is saved for the whole household. Tasks you never placed keep the old order (due date,
+  then priority) and sort after the placed ones, so a new task lands at the end of its category.
+  A recurring task passes its place on to its next occurrence; a task that moves to another
+  category loses its place. A "Sort automatically" button in the group header returns a category
+  to the automatic order. Grouping by due date, the board, selection mode, `tasks: read` and the
+  wall display are unchanged. The API gets `PATCH /api/v1/tasks/reorder` and
+  `POST /api/v1/tasks/reorder/reset`, and `sort_order` on each task (migration 242).
+
+- **Custom modules can be installed from Settings, from GitHub or as a ZIP file, where the operator
+  allows it.** Until now a third-party module reached Yuvomi only as a folder copied into `modules/`
+  on the server. The new page Settings → Modules → Add custom module (admin only) takes the address
+  of a public GitHub repository or an uploaded `.zip` and installs the module from it. **The feature
+  is off unless the operator sets `MODULES_ALLOW_WEB_INSTALL`**: a module is JavaScript that runs
+  with the session of every member who opens it, so installing one is the operator's choice. A
+  module installed this way arrives disabled until an admin approves it in Active modules from a
+  browser session, and the web interface removes or replaces only what it installed. Limits, checks
+  and the API are in `MODULES.md` under "Installing From Settings".
+- **Move a shopping item to another list** (#1700, from D#998). The edit dialog has a list
+  selector under amount and category when there is more than one list. The item moves as it is -
+  name, amount, category, note, link, price and shop - and lands at the end of its category on
+  the other list, so nothing has to be typed again. Between two lists mirrored from a CalDAV
+  server the entry itself moves: Yuvomi reads it in the old list, stores it unchanged in the new
+  one and only then removes it from the old one, so its tags, alarms and everything another app
+  keeps on it come along - also from one account to another. If the server does not accept it
+  in the new list, the entry stays untouched where it was, and after the fifth refusal the item
+  is back on the list it came from, with a line in the sync log. The same happens when the new
+  list no longer exists on the server. While the new list is switched off in the reminder sync,
+  the move waits until it is switched on again. Moving an item to a
+  list that is not mirrored removes it on the server without deleting it in Yuvomi.
+  `PATCH /api/v1/shopping/items/:itemId` takes `list_id` for the same move (migration 243).
 
 ### Changed
 
@@ -41,9 +96,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   well as German and English, so "hvetemel" lands under baked goods and "oppvaskmiddel" under
   household instead of everything ending up under "Other". Matching stays whole-word, so a
   compound such as "kyllinglår" still falls through unless it is listed on its own.
+- **The wall shows only what the whole household may see** (#1817). Wall mode is a shared
+  surface, not a personal screen: it hangs in the kitchen, whoever opened it. The day's
+  programme and "Who's up today" now leave out every task and appointment that is not visible
+  to everyone - a task set to "Assignees only" or private, an appointment set to "Assignees
+  only" or private, and appointments from a calendar subscription that is not shared with the
+  household - also when the wall was opened from the session of the person they belong to.
+  Someone who would only be "up today" because of such an entry is not listed. The same holds
+  for what concerns one person alone: a wall opened from a member's session no longer shows
+  that person's medication doses, own shift, due reminders or the reward requests waiting for
+  their approval - a coupled display never showed them, and now every wall reads the same.
+  And the device on the wall no longer receives what the wall never draws: pinned notes, the
+  budget, shared-expense balances, quick links, countdowns and the housekeeper's unpaid amount
+  used to travel along in the background and now stay off it, as does anything a future module
+  adds until it is given a place on the wall.
+  The normal overview and "Today at a glance" stay personal and show all of it as before.
 
 ### Fixed
 
+- **A task due late tomorrow evening is no longer labelled "Due today" on the dashboard.** A task
+  due tomorrow at 22:00 or later and less than 24 hours away gets its own label next to the date,
+  "Due soon". In English and 17 other languages that label carried the text of "Due today", so the
+  tile said "today" in front of tomorrow's date. It now reads "Due soon" in each of them. Dutch
+  follows with the pending Dutch locale update (#1892).
 - **An archived shared-expense group now refuses changes on the server too** (#1747). Until now only
   the page was locked: an API client or a stale tab could still add, edit or delete expenses,
   comments, settlements and recurring expenses in a group the household had put away, and the
@@ -83,6 +158,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   you changed or took back during the upload, and for a new shopping item that left its synced
   list in that moment. Until now such a task also lost the list you had just chosen and stayed in
   the old one.
+- **An entry deleted after an interrupted upload no longer comes back** (#1882). When a new
+  event, task or shopping item reached the CalDAV or iCloud server but the server's answer got
+  lost on the way - a dropped connection, a timeout, a server error after saving - Yuvomi kept
+  the entry as not yet uploaded. If you deleted it before the next sync, the copy stayed on the
+  server and the next sync brought the deleted entry back. If you instead picked another calendar
+  or list for it, or set it back to "Local", the next sync added the server copy as a second
+  entry. Yuvomi now remembers that an upload was sent and never confirmed: the next sync removes
+  the copy from the server instead of importing it, and the entry ends up only where you last
+  put it. The copy is removed with the next sync run, not at the moment you delete the entry,
+  and only after Yuvomi has read that the entry at that address is really its own. An upload
+  that the server finishes late is covered for 24 hours after the last attempt.
 - **A CalDAV event belongs to the account that brought it** (#1860). With two or more CalDAV
   accounts, an event was identified by its UID alone. When a second account served an event with
   the same UID, it took over the entry of the first: title, calendar and address then came from
@@ -122,6 +208,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of literal translations, and singular forms for a count of one instead of "(er)".
 - **Fix some dutch translations** Some wordings in dutch were corrected. Most notably the labels
   near due tasks.
+- **Deleting an entry of a switched-off CalDAV calendar or reminder list no longer deletes it on
+  the server, and is no longer lost or stuck** (#1884). Switching a calendar or reminder list off
+  in Settings is meant to leave everything in it alone. A deletion made in Yuvomi for an entry of
+  such a calendar was sent to the server right away all the same; if the server refused it five
+  times, Yuvomi gave up, and the deleted event came back when you switched the calendar on
+  again. For tasks and shopping items the deletion always went through.
+  In other cases the deletion waited for good, also after the calendar itself had been deleted on
+  the server. Now the deletion waits while the calendar or list is switched off: nothing is
+  deleted there, and waiting does not use up its retries. It is carried out when you switch the
+  calendar or list on again, so the entry does not come back, and it is dropped when the
+  calendar or list no longer exists on the server or the account is removed. The sync log names
+  how many deletions are waiting. For iCloud, a deletion for a calendar that no longer exists is
+  dropped the same way.
 
 ## [2.76.0] - 2026-10-11
 

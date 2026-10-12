@@ -688,7 +688,8 @@ member can then fetch the picture that the service holds for their saved email a
 **Settings → Account → Use my Gravatar**. The server fetches it once, on that click, and stores it
 exactly like an uploaded picture; nothing is fetched again later. Split-expense guests do not get
 the button. Only a SHA-256 hash of the lowercased address, this server's IP and its User-Agent
-reach the service, never the address itself. The fetch uses HTTPS only, follows at most five
+reach the service, never the address itself. The hint under the button and the error messages
+name the service by the host name of the URL you set, so with a mirror they name the mirror. The fetch uses HTTPS only, follows at most five
 redirects, refuses private network targets, times out after 8 seconds and accepts at most 512 KiB
 of PNG, JPEG or WebP. Only A-Z is lowercased (the same key as the email matching,
 `emailMatchKey`), while Gravatar lowercases everything: an address with a non-ASCII capital
@@ -707,6 +708,7 @@ letter hashes differently from Gravatar and gets "no picture".
 | `DB_ALLOW_NEWER_SCHEMA` | Emergency switch, normally unset. An older Yuvomi refuses to start on a database a newer version has opened (see [Going back](#going-back)); `1` starts it anyway, at your own risk, with a warning on every start. | - | No |
 | `DATA_DIR` | Host directory mounted at `/data` inside the container (set in `.env` or `docker-compose.yml`). | `./data` | No |
 | `MODULES_DIR` | Host directory mounted at `/app/modules` inside the container - the drop-in folder for [third-party modules](../MODULES.md). Like `BACKUP_DIR`, the app also reads this name itself as the directory *inside* the container, which is why `docker-compose.yml`, `podman-compose.yml` and the Quadlet pin it to `/app/modules` there. With Compose the value in `.env` therefore only moves the mount source; the Quadlet keeps its host folder in the unit file, and Portainer uses a named volume. | `./modules` | No |
+| `MODULES_ALLOW_WEB_INSTALL` | Let an admin install third-party modules from Settings (ZIP upload or GitHub URL) into that folder (`true`/`false`). What it opens: an admin in a browser session can put same-origin script on the server without any file access, and what it writes stays after the session ends. A module installed that way stays off until an admin approves it in a browser session, and the web interface deletes only what it installed. Off by default: modules are then copied into the folder by hand, as described in [MODULES.md](../MODULES.md). | `false` | No |
 | `BACKUP_DIR` | In `.env`/`docker-compose.yml`: the **host** directory mounted at `/backups`. Inside the container the app reads the same name as the **container** path it writes to - the compose files pin it to `/backups`, and the image defaults to `/backups` as well. Only override it inside the container if you mount your backup volume somewhere else. | `./backups` (host) / `/backups` (container) | No |
 
 > **Where the backups go.** There is no `BACKUP_DIR` in the setup wizard, and that is deliberate.
