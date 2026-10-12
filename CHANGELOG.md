@@ -7,8 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Checked-off shopping items collect in one section at the end of the list** (#1816, from D#1624).
+  Ticking an item moves it out of its category into "Checked off", a collapsed section at the
+  bottom that shows how many items it holds. The items stay on the list, and the list above gets
+  shorter as you shop. Nothing moves while you are still ticking: the rows wait until you pause
+  for a moment and then move together. Whether the section is open is remembered per person and
+  per list. Adding a name that is checked off on the open list - picked from the suggestions or
+  typed - brings that row back instead of adding a second one, and a short note says so; an
+  amount you typed replaces the row's, an empty field keeps it. A name that is not checked off
+  on the list is added as before.
+- **Dutch date format DD-MM-YYYY** (#1847). The new `DD-MM-YYYY` choice is in Settings → Account →
+  Appearance → Date format, and the Netherlands region now uses it instead of `DD.MM.YYYY`.
+  Dates, the date field placeholder, short dates and typed input all follow it. Existing households
+  keep the format they have set. A household that already has the Netherlands as its region gets
+  the new format by setting "Region" to "Custom" and then "Preferred date format" to `DD-MM-YYYY`.
+- **A profile picture can be fetched from Gravatar once, if the operator turns it on.** Off by
+  default: while `GRAVATAR_BASE_URL` is unset or empty nothing is sent and Settings → Account shows
+  no button. An operator opts in by setting it to `https://gravatar.com/avatar/` or a Libravatar
+  mirror; a household member can then fetch the picture for their saved address, named in the
+  hint, and it is stored exactly like an upload, never fetched again. Split-expense guests are
+  refused. Only a SHA-256 hash of the address and the server's IP leave the server, through the
+  SSRF-guarded client with an 8 second limit, a 512 KiB cap and a signature check. If the
+  picture, the address or the account changes while the fetch runs, nothing is stored (409).
+- **Tapping a category or subcategory in the budget overview filters the transactions list.**
+  (#1593, from D#1583) The filter applies in place and can be cleared again.
+
+### Changed
+
+- **Recipes mirrored from a Norwegian Mealie or Tandoor sort into shopping categories.** The
+  keyword list that guesses a category from an ingredient's name now knows Norwegian words as
+  well as German and English, so "hvetemel" lands under baked goods and "oppvaskmiddel" under
+  household instead of everything ending up under "Other". Matching stays whole-word, so a
+  compound such as "kyllinglår" still falls through unless it is listed on its own.
+
 ### Fixed
 
+- **An archived shared-expense group now refuses changes on the server too** (#1747). Until now only
+  the page was locked: an API client or a stale tab could still add, edit or delete expenses,
+  comments, settlements and recurring expenses in a group the household had put away, and the
+  hourly run kept booking its recurring expenses. Every write on an archived group is now answered
+  with 409 (`group_archived`) and changes nothing; restoring the group, reading it and deleting it
+  under the existing rules work as before. The hourly run skips an archived group without booking
+  or pausing anything, and restoring the group moves its active recurring expenses to their first
+  date from today on, so the months in between are never booked afterwards.
 - **Moving an event to another CalDAV calendar no longer leaves it in both** (#1861). A move
   stores the event in the new calendar and then removes it from the old one. When the server
   stored the copy but refused the removal - an old calendar that is shared read-only, or a server
@@ -18,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   five times like any other refused deletion, and until then Yuvomi shows the event once, in the
   calendar you moved it to. After the fifth refusal Yuvomi gives up, and the event stays in both
   calendars until you remove one copy yourself. Events that were left doubled before the update
-  are not cleaned up.
+  are not cleaned up. A removal that is still waiting only takes the entry as it was when you
+  moved the event (#1883): if the entry in the old calendar has been changed since, or the event
+  was put back there from another app, Yuvomi no longer removes it.
 - **Editing or deleting an entry while it is being uploaded is no longer lost or undone**
   (#1862). Sending an entry to a CalDAV or iCloud server takes a moment, and Yuvomi booked the
   result against the entry as it was before that moment. If you deleted a new event, task or
@@ -28,8 +73,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   edit. And a second edit to a task or shopping item made while the first one was on its way was
   replaced by the first. Yuvomi now looks at the entry again after the server has answered: an
   entry deleted in the meantime is removed from the server too, and an edit made in the meantime
-  is sent after it. Not covered yet: if you change the target calendar of an event while it is
-  being uploaded, the event stays in the calendar it was uploaded to.
+  is sent after it.
+- **Changing where an entry is synced to while it is being uploaded is now followed** (#1881). If
+  you picked another CalDAV calendar for a new event, or set it back to "Local", in the moment
+  its upload was on the way, the event stayed in the calendar it had just been sent to, and saving
+  it again changed nothing. It now ends up where you last put it: moved to the other calendar of
+  the same account, or removed from the server again and kept as a local event (or uploaded
+  through the other account, if you chose one). The same holds for a new task whose reminder list
+  you changed or took back during the upload, and for a new shopping item that left its synced
+  list in that moment. Until now such a task also lost the list you had just chosen and stayed in
+  the old one.
 - **A CalDAV event belongs to the account that brought it** (#1860). With two or more CalDAV
   accounts, an event was identified by its UID alone. When a second account served an event with
   the same UID, it took over the entry of the first: title, calendar and address then came from
@@ -63,6 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Events without an account that no account delivers any more stay until you delete them.
   - If you delete an event that a second account also keeps as its own copy, that account adds it
     back on its next sync.
+- **Norwegian Bokmål reads more naturally.** A second pass over the app
+  and the installer after using them day to day: one word for a shift ("vakt"), a reminder
+  ("påminnelse") and a tablet ("nettbrett") throughout, "container" and "image" for Docker
+  instead of literal translations, and singular forms for a count of one instead of "(er)".
 
 ## [2.76.0] - 2026-10-11
 
