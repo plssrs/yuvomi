@@ -120,6 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the installer after using them day to day: one word for a shift ("vakt"), a reminder
   ("påminnelse") and a tablet ("nettbrett") throughout, "container" and "image" for Docker
   instead of literal translations, and singular forms for a count of one instead of "(er)".
+- **Fix some dutch translations** Some wordings in dutch were corrected. Most notably the labels
+  near due tasks.
 
 ## [2.76.0] - 2026-10-11
 
