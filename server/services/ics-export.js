@@ -5,13 +5,17 @@
  * Abhängigkeiten: keine externen.
  */
 
+import { localCalendarIdSql } from './local-calendars.js';
+import { visibilityWhere } from './visibility.js';
+
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
-  householdTimeZone, isValidTimeZone, localToUTC, shiftDateKey, utcToWall,
+  householdTimeZone, isValidTimeZone, localToUTC, shiftDateKey, storedToInstantIso, utcToWall,
 } from '../utils/timezone.js';
 import { formatWall, vtimezoneFor } from '../utils/vtimezone.js';
-import { outboundDateRange } from './outbound-dtstart.js';
+import { outboundDateRange, outboundRecurrenceRule } from './outbound-dtstart.js';
 import { rruleLine } from './recurrence.js';
+import { timedSeriesUntil } from '../utils/rrule-until.js';
 import { activeAccountSql } from './account-state.js';
 import { icsSubscriptionVisibleWhere } from './visibility.js';
 import { birthdaysSwitchedOff, notBirthdayEventSql } from './household-modules.js';
@@ -128,6 +132,14 @@ function usesTzid(ev) {
 // Die Zone, an der naive Werte verankert werden. null, wenn sie UTC-gleich oder
 // nicht auflösbar ist: dann sind die Ziffern bereits UTC und ein 'Z' ist eindeutiger
 // als ein VTIMEZONE über eine Zone, die viele Clients nicht als solche führen.
+/**
+ * Die Zone, in der zonenlose Ziffern geschrieben sind, aus der Feed-Zone: null
+ * heisst dort "UTC-gleich", und genau so sind die Ziffern dann gemeint.
+ */
+function householdReadingZone(feedZone) {
+  return feedZone || 'UTC';
+}
+
 function resolveFeedZone(tz) {
   const zone = (tz || '').trim();
   if (!zone || /^(UTC|GMT|Z|Etc\/(UTC|GMT|GMT0|GMT\+0|GMT-0|Zulu|Universal|Greenwich))$/i.test(zone)) return null;
@@ -157,7 +169,7 @@ function usesFeedZone(ev) {
 function recurrenceSlotProp(prop, master, dateKey, feedZone) {
   if (master.all_day) return `${prop};VALUE=DATE:${formatDate(dateKey)}`;
   if (usesTzid(master)) {
-    const baseOccurrence = baseOccurrenceFor(master, dateKey);
+    const baseOccurrence = baseOccurrenceFor(master, dateKey, householdReadingZone(feedZone));
     return `${prop};TZID=${master.tzid}:${formatWall(baseOccurrence.start_datetime, master.tzid)}`;
   }
   const timeSuffix = master.start_datetime.slice(10);
@@ -173,9 +185,13 @@ function recurrenceSlotProp(prop, master, dateKey, feedZone) {
 function exceptionSlotProp(master, dateKey, feedZone) {
   if (master.all_day) return `EXDATE;VALUE=DATE:${formatDate(dateKey)}`;
   if (usesTzid(master)) {
-    const wall = utcToWall(master.start_datetime, master.tzid);
-    let instant = dateKey + master.start_datetime.slice(10);
-    if (wall?.date === master.start_datetime.slice(0, 10)) {
+    // Zonenlose Ziffern zuerst in der Haushaltszone zum Zeitpunkt (#1993):
+    // dieselbe Lesart wie die Expansion, deren UTC-Tag die Ausnahme traegt.
+    const masterStart = storedToInstantIso(master.start_datetime, householdReadingZone(feedZone))
+      ?? master.start_datetime;
+    const wall = utcToWall(masterStart, master.tzid);
+    let instant = dateKey + masterStart.slice(10);
+    if (wall?.date === masterStart.slice(0, 10)) {
       instant = localToUTC(`${dateKey}T${wall.time}`, master.tzid);
     } else if (wall) {
       for (const offset of [0, -1, 1]) {
@@ -211,7 +227,8 @@ function buildVEvent(
   // A replacement inherits the master's rule for effective reads, but its own
   // DTSTART/DTEND are concrete moves and must never be snapped to that rule.
   const outboundEvent = recurrenceMaster ? { ...ev, recurrence_rule: null } : ev;
-  const { start_datetime: dtstart, end_datetime: dtende } = outboundDateRange(outboundEvent);
+  const readZone = householdReadingZone(feedZone);
+  const { start_datetime: dtstart, end_datetime: dtende } = outboundDateRange(outboundEvent, { householdZone: readZone });
 
   if (recurrenceMaster) {
     lines.push(recurrenceSlotProp(
@@ -226,8 +243,13 @@ function buildVEvent(
   } else if (usesTzid(ev)) {
     // Wiederkehrende Serie mit Zone: lokale Wanduhrzeit + TZID, damit der Abonnent
     // pro Vorkommen DST-korrekt expandiert (statt fixem UTC-Suffix → Winter-Drift, #549).
-    lines.push(`DTSTART;TZID=${ev.tzid}:${formatWall(dtstart, ev.tzid)}`);
-    if (dtende) lines.push(`DTEND;TZID=${ev.tzid}:${formatWall(dtende, ev.tzid)}`);
+    //
+    // Zonenlose Ziffern sind Wanduhr des Haushalts (#1993): erst in dessen
+    // Zone zum Zeitpunkt, dann zur Wanduhr der Serienzone. `formatWall` direkt
+    // auf den Ziffern las sie in der Zone des PROZESSES.
+    const inSeriesZone = (value) => formatWall(storedToInstantIso(value, readZone) ?? value, ev.tzid);
+    lines.push(`DTSTART;TZID=${ev.tzid}:${inSeriesZone(dtstart)}`);
+    if (dtende) lines.push(`DTEND;TZID=${ev.tzid}:${inSeriesZone(dtende)}`);
   } else {
     // Extern synchronisierte Events tragen ein explizites Z/Offset → echte UTC-Konvertierung.
     // Lokal angelegte Events sind naiv (keine Z/Offset) → Wanduhrzeit des Haushalts,
@@ -249,7 +271,17 @@ function buildVEvent(
   // rruleLine statt Handarbeit: eine eingelesene Serie bringt ihr `RRULE:` schon
   // mit, ein blindes Praefix erzeugte `RRULE:RRULE:FREQ=...` und liess strikte
   // Abonnenten das ganze Event verwerfen (#761).
-  if (ev.recurrence_rule && !recurrenceMaster) lines.push(rruleLine(ev.recurrence_rule));
+  //
+  // Ein reines Datum als UNTIL ist neben einem getimten DTSTART ungueltig und
+  // wird zum Ende des Ortstags in der Zone, in der DTSTART oben steht (#1974,
+  // utils/rrule-until.js): TZID der Serie, sonst die Feed-Zone fuer naive
+  // Werte, sonst UTC. Ein UNTIL mit Uhrzeit aus dem alten Formular geht an einer
+  // eigenen Serie ohne Zone zuvor als Datum hinaus (#1992, outboundRecurrenceRule).
+  if (ev.recurrence_rule && !recurrenceMaster) {
+    const untilZone = usesTzid(ev) ? ev.tzid : (hasExplicitOffset(dtstart) ? null : feedZone);
+    const rule = outboundRecurrenceRule(ev);
+    lines.push(rruleLine(ev.all_day ? rule : timedSeriesUntil(rule, untilZone)));
+  }
   // Einzeln ausgenommene Vorkommen (EXDATE, #489). Zeit-Teil = Master-Startzeit,
   // damit die EXDATE-Instanz exakt auf ein RRULE-Vorkommen trifft.
   if (!recurrenceMaster && ev.recurrence_rule
@@ -262,18 +294,23 @@ function buildVEvent(
   return lines.map(foldLine);
 }
 
-function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn)) {
+function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn), options = {}) {
   const windowStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
     .toISOString().slice(0, 10);
   const feedZone = resolveFeedZone(tz);
+  const calendarFilterSql = options.localCalendarId
+    ? `AND ${localCalendarIdSql()} = ? AND ${visibilityWhere('e', 'event_assignments', 'event_id', 'NULL')}`
+    : '';
+  const calendarFilterParams = options.localCalendarId ? [options.localCalendarId] : [];
+  const calendarName = options.calendarName || 'Yuvomi';
 
   // Identische Sichtbarkeitslogik wie GET /api/v1/calendar:
   // alle Events außer fremden, nicht-geteilten ICS-Abos.
-  const showAssignees = !!conn.prepare(
+  const showAssignees = options.showAssignees ?? !!conn.prepare(
     `SELECT calendar_feed_show_assignees AS v FROM users WHERE id = ?`
   ).get(userId)?.v;
 
-  // Namen nur laden, wenn der Feed-Eigentümer sie im Titel anzeigen will (#482);
+  // Namen nur laden, wenn die Feed-Option sie im Titel anzeigen will (#482);
   // im Default-Fall (aus) spart das die korrelierte Subquery je Event.
   const assigneeSelect = showAssignees ? `,
            (SELECT json_group_array(name) FROM (
@@ -289,7 +326,8 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn))
   // sie nicht mit; nach dem Wiedereinschalten holt der naechste Abruf sie zurueck.
   // Der Feed selbst bleibt auch bei abgeschaltetem Kalender erreichbar - er ist
   // die eigene Ausgabe des Moduls, keine Mischstelle (docs/DECISIONS.md 11).
-  const withoutBirthdays = birthdaysSwitchedOff(conn) ? `
+  const withoutBirthdays = (birthdaysSwitchedOff(conn)
+    || (!options.localCalendarId && !getFeedIncludeBirthdays(conn, userId))) ? `
     AND ${notBirthdayEventSql('e')}` : '';
 
   const queriedRows = conn.prepare(`
@@ -300,8 +338,9 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn))
       e.recurrence_rule IS NOT NULL
       OR DATE(e.start_datetime) >= ?
     )${withoutBirthdays}
+    ${calendarFilterSql}
     ORDER BY e.start_datetime ASC
-  `).all(userId, windowStart);
+  `).all(userId, windowStart, ...calendarFilterParams);
   const referencedMasterIds = new Set(queriedRows
     .filter(isLinkedOccurrence)
     .map((event) => Number(event.recurrence_parent_id)));
@@ -377,7 +416,7 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn))
     'PRODID:-//Yuvomi//Calendar Feed//DE',
     'CALSCALE:GREGORIAN',
     'METHOD:PUBLISH',
-    'X-WR-CALNAME:Yuvomi',
+    `X-WR-CALNAME:${escapeICSText(calendarName)}`,
   ];
   // Kalenderzone für die Clients, die den Header auswerten (Google, Thunderbird).
   // Sie ersetzt die TZID-Parameter nicht, sondern deckt den Rest: Termine ohne
@@ -400,6 +439,18 @@ function buildFeed(conn, userId, now = new Date(), tz = householdTimeZone(conn))
   return out.join('\r\n') + '\r\n';
 }
 
+function buildCalendarFeed(conn, calendarId, now = new Date(), tz = householdTimeZone(conn)) {
+  const calendar = conn.prepare('SELECT * FROM local_calendars WHERE id = ?').get(calendarId);
+  if (!calendar) return null;
+  // A household-wide calendar feed has no user identity. Do not inherit the
+  // creator's personal preference; local feeds consistently omit assignees.
+  return buildFeed(conn, 0, now, tz, {
+    localCalendarId: calendar.id,
+    calendarName: calendar.name,
+    showAssignees: false,
+  });
+}
+
 function getFeedToken(conn, userId) {
   const row = conn.prepare(`SELECT calendar_feed_token AS t FROM users WHERE id = ?`).get(userId);
   return row?.t ?? null;
@@ -415,8 +466,11 @@ function clearFeedToken(conn, userId) {
   conn.prepare(`UPDATE users SET calendar_feed_token = NULL WHERE id = ?`).run(userId);
 }
 
+/** Spalten, die `findUserIdByFeedToken` lesen darf - niemals aus dem Input. */
+const FEED_TOKEN_COLUMNS = new Set(['calendar_feed_token', 'waste_feed_token', 'birthday_feed_token']);
+
 /**
- * Findet den Besitzer eines Feed-Tokens ueber timingSafeEqual statt eine
+ * Findet den Besitzer eines Feed-Tokens ueber timingSafeEqual statt einer
  * SQL-Gleichheit `WHERE token = ?` (die als String-Vergleich je Zeile frueh
  * abbrechen kann, sobald das erste Byte abweicht - dieselbe Klasse Fehler,
  * gegen die CSRF/TOTP timingSafeEqual schon einsetzen). Ein Token ist immer
@@ -424,15 +478,29 @@ function clearFeedToken(conn, userId) {
  * vom Client dagegen beliebig lang - die Laengenpruefung selbst verraet
  * nichts Geheimes, sie steht nur davor, weil timingSafeEqual bei
  * ungleicher Laenge wirft.
+ *
+ * `column` muss eine der drei bekannten Feed-Token-Spalten sein - sie kommt
+ * aus einer Konstante im Aufrufer, nie aus dem Request.
  */
-function findUserIdByFeedToken(conn, token) {
+function findUserIdByFeedToken(conn, column, token) {
+  if (!FEED_TOKEN_COLUMNS.has(column)) throw new Error(`Unknown feed token column: ${column}`);
   if (!token) return null;
   const candidate = Buffer.from(token, 'utf8');
-  for (const row of conn.prepare(`SELECT id, calendar_feed_token AS t FROM users WHERE calendar_feed_token IS NOT NULL AND ${activeAccountSql('users')}`).all()) {
+  for (const row of conn.prepare(`SELECT id, ${column} AS t FROM users WHERE ${column} IS NOT NULL AND ${activeAccountSql('users')}`).all()) {
     const stored = Buffer.from(row.t, 'utf8');
     if (stored.length === candidate.length && timingSafeEqual(stored, candidate)) return row.id;
   }
   return null;
+}
+
+function getFeedIncludeBirthdays(conn, userId) {
+  const row = conn.prepare('SELECT calendar_feed_include_birthdays AS v FROM users WHERE id = ?').get(userId);
+  return row?.v !== 0;
+}
+
+function setFeedIncludeBirthdays(conn, userId, value) {
+  conn.prepare('UPDATE users SET calendar_feed_include_birthdays = ? WHERE id = ?').run(value ? 1 : 0, userId);
+  return value;
 }
 
 function getFeedShowAssignees(conn, userId) {
@@ -449,8 +517,11 @@ function setFeedShowAssignees(conn, userId, value) {
 }
 
 export {
-  escapeICSText, foldLine, buildFeed,
+  escapeICSText, foldLine, buildFeed, buildCalendarFeed,
   getFeedToken, regenerateFeedToken, clearFeedToken, findUserIdByFeedToken,
   getFeedShowAssignees, setFeedShowAssignees,
+  getFeedIncludeBirthdays, setFeedIncludeBirthdays,
   resolveFeedZone, stampProp,
 };
+
+export const __test = { buildVEvent };

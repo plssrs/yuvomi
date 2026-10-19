@@ -14,7 +14,7 @@ function withBadRequest(status, description, extra = {}) {
 }
 
 export function birthdaysPaths() {
-  return {
+  return withCaseReasons({
     '/api/v1/birthdays': {
       get: op({ summary: 'List birthdays', tag: 'Birthdays' }),
       post: op({
@@ -32,6 +32,14 @@ export function birthdaysPaths() {
         description: 'Ordered by distance to each person’s next birthday; optional name-day fields do not affect ordering.',
         tag: 'Birthdays',
       }),
+    },
+    '/api/v1/birthdays/feed': {
+      get: op({ summary: 'Get own birthday ICS subscription link', tag: 'Birthdays',
+        description: 'The independent feed includes all saved birthdays and name days, even with reminders disabled, and excludes unrelated calendar events. Calendar and birthday feed tokens are separate.' }),
+      delete: op({ summary: 'Disable own birthday ICS subscription', tag: 'Birthdays', stateChanging: true }),
+    },
+    '/api/v1/birthdays/feed/regenerate': {
+      post: op({ summary: 'Enable or rotate own birthday ICS subscription link', tag: 'Birthdays', stateChanging: true }),
     },
     // BEIDE IMPORT-ROUTEN VERLANGEN KONTAKT-ZUGRIFF, nicht nur Kalender (#1241).
     // Sie lesen aus `contacts`, obwohl ihr Pfad `birthdays` sagt; `op()` haengt
@@ -81,5 +89,24 @@ export function birthdaysPaths() {
       }),
       delete: op({ summary: 'Delete birthday', tag: 'Birthdays', params: [idParam()], stateChanging: true }),
     },
-  };
+  });
+}
+
+// #1909: die Faelle, die ein Nutzer erreicht, tragen einen `reason` neben dem
+// englischen `error` - je Operation der Satz, der sie nennt.
+const BIRTHDAY_GONE = '`birthdays_birthday_not_found` (404, the birthday does not exist - deleted)';
+const CASE_REASONS = {
+  '/api/v1/birthdays/{id}': { put: BIRTHDAY_GONE, delete: BIRTHDAY_GONE },
+};
+
+function withCaseReasons(paths) {
+  for (const [path, operations] of Object.entries(CASE_REASONS)) {
+    for (const [method, reasons] of Object.entries(operations)) {
+      const operation = paths[path]?.[method];
+      if (!operation) throw new Error(`openapi birthdays: ${method} ${path} is not documented`);
+      const note = `A refusal a user can reach carries a \`reason\` next to \`error\` (#1909): ${reasons}.`;
+      operation.description = operation.description ? `${operation.description}\n\n${note}` : note;
+    }
+  }
+  return paths;
 }

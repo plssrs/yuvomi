@@ -11,11 +11,11 @@ import { documentVisibleSql } from './document-access.js';
 import { budgetDetailsVisibleWhere, resolveBudgetMode } from './budget-visibility.js';
 
 import {
-  expandRecurringEvents, loadEventExceptions,
+  expandRecurringEvents, loadEventExceptions, seriesReadingZone,
 } from './calendar-events.js';
 import { eventProjectionSql, resolveProjectedEventRows } from './calendar-event-reader.js';
 import { notBirthdayEventSql } from './household-modules.js';
-import { shiftDateKey, todayKey } from '../utils/timezone.js';
+import { householdTimeZone, shiftDateKey, todayKey } from '../utils/timezone.js';
 
 export const SEARCH_LIMIT = 5;
 // Wie viele Termin-Treffer AUFGELOEST werden, bevor die fuenf fruehesten
@@ -326,6 +326,12 @@ export function eventSearchWindow(database) {
 export function resolveEventSearchRows(database, rows, from = null, to = null, options = {}) {
   const recurringIds = rows.filter((row) => row.recurrence_rule).map((row) => row.id);
   const exceptions = loadEventExceptions(database, recurringIds);
+  // Einmal je Aufruf, nicht je Treffer - und nur, wenn ein Treffer sie braucht
+  // (zonenlose Ziffern neben einer `tzid`, #1993).
+  const householdZone = rows.reduce((zone, row) => zone ?? seriesReadingZone(database, row), null);
+  // Das Fenster ist ein Haushaltsfenster (`eventSearchWindow`, ab `todayKey()`):
+  // eine Serie mit eigener Zone wird an ihrem Haushaltstag gemessen (#1999).
+  const windowZone = from && to ? householdTimeZone(database) : null;
   const displayRows = rows.map((row) => {
     if (!row.recurrence_rule || !from || !to) return row;
     return expandRecurringEvents(
@@ -333,7 +339,7 @@ export function resolveEventSearchRows(database, rows, from = null, to = null, o
       from,
       to,
       exceptions,
-      { includeRecurrenceIdentity: true },
+      { includeRecurrenceIdentity: true, householdZone, windowZone },
     )[0] || row;
   });
   return resolveProjectedEventRows(database, displayRows, options)

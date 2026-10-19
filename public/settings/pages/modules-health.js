@@ -8,10 +8,12 @@
  */
 import { api } from '/api.js';
 import { t } from '/i18n.js';
-import { esc } from '/utils/html.js';
-import { openModal, closeModal, confirmOverModal, refocusAfterRender } from '/components/modal.js';
+import { esc, REQUIRED_MARK } from '/utils/html.js';
+import { openModal, closeModal, captureModalContext, confirmOverModal, refocusAfterRender } from '/components/modal.js';
 import { intervalMonthsToInput, intervalInputToMonths } from '/utils/health-prevention.js';
 import { rowActionHtml } from '/utils/row-action.js';
+import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 const KINDS = ['vaccination', 'checkup'];
 const MAX_INTERVAL_MONTHS = 600;
@@ -111,6 +113,17 @@ async function reload() {
   wire(_container);
 }
 
+/**
+ * Fehler-Toast der Seite (#1909): der Satz der App, nie der des Servers. Gibt
+ * es die bearbeitete Art nicht mehr, geht der Dialog zu und die Liste kommt
+ * frisch vom Server.
+ */
+function reportError(err) {
+  window.yuvomi?.showToast(errorSentence(err), 'danger');
+  if (!isGone(err)) return;
+  closeModal({ force: true }).then(() => reload()).then(() => refocusAfterRender()).catch(() => {});
+}
+
 function openTypeModal(type) {
   const isEdit = !!type;
   const val = (v) => (v == null ? '' : String(v));
@@ -122,7 +135,7 @@ function openTypeModal(type) {
     content: `
       <form id="health-prevention-type-form" class="form-stack">
         <div class="form-field">
-          <label class="label" for="hpt-name">${esc(t('settings.healthPreventionTypeName'))}</label>
+          <label class="label" for="hpt-name">${esc(t('settings.healthPreventionTypeName'))}${REQUIRED_MARK}</label>
           <input class="input" id="hpt-name" type="text" maxlength="200" required value="${esc(val(type?.name))}">
         </div>
         <div class="form-field">
@@ -160,10 +173,11 @@ function openTypeModal(type) {
         </div>
       </form>`,
     onSave(panel) {
-      panel.querySelector('#hpt-icon-trigger').addEventListener('click', async () => {
+      panel.querySelector('#hpt-icon-trigger').addEventListener('click', async (event) => {
+        const trigger = event.currentTarget;
         const { openIconPicker } = await import('/components/icon-picker.js');
         const hidden = panel.querySelector('#hpt-icon');
-        const chosen = await openIconPicker(hidden.value || null, { suggestions: ICON_SUGGESTIONS });
+        const chosen = await openIconPicker(hidden.value || null, { suggestions: ICON_SUGGESTIONS, owner: trigger });
         if (chosen === undefined) return; // Abbruch - nichts aendern
         hidden.value = chosen || 'syringe'; // "kein Symbol" ergibt hier keinen Sinn - der Typ behaelt sein Zeichen
         const btn = panel.querySelector('#hpt-icon-trigger');
@@ -174,6 +188,9 @@ function openTypeModal(type) {
 
       panel.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeModal({ force: true }));
       panel.querySelector('[data-action="delete"]')?.addEventListener('click', async () => {
+        // VOR der Rueckfrage: geschlossen wird nur dieser Dialog, nicht einer,
+        // der waehrend der Anfrage aufgegangen ist (#1997).
+        const modalContext = captureModalContext();
         const confirmed = await confirmOverModal(t('settings.healthPreventionDeleteTypeConfirm'), {
           danger: true,
           confirmLabel: t('common.delete'),
@@ -181,13 +198,18 @@ function openTypeModal(type) {
         });
         if (!confirmed) return;
         try {
-          await api.delete(`/health/prevention/types/${type.id}`);
-          closeModal({ force: true });
+          // Schon geloescht (ein anderer Admin war schneller): erledigt (#1909).
+          try {
+            await api.delete(`/health/prevention/types/${type.id}`);
+          } catch (err) {
+            if (!isAlreadyDeleted(err, 'health_prevention_type_not_found')) throw err;
+          }
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(t('settings.healthPreventionTypeDeleted'), 'success');
           await reload();
           refocusAfterRender();
         } catch (err) {
-          window.yuvomi?.showToast(err?.data?.error || t('common.errorGeneric'), 'danger');
+          reportError(err);
         }
       });
 
@@ -212,6 +234,7 @@ function openTypeModal(type) {
         if (intervalMonths != null) body.default_interval_months = intervalMonths;
         else if (isEdit) body.default_interval_months = null;
 
+        const modalContext = captureModalContext();
         submitBtn.disabled = true;
         try {
           if (isEdit) {
@@ -219,18 +242,20 @@ function openTypeModal(type) {
           } else {
             await api.post('/health/prevention/types', body);
           }
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(t('settings.healthPreventionTypeSaved'), 'success');
-          await reload();
+          await reloadAfterSave(() => reload());
           refocusAfterRender();
         } catch (err) {
           submitBtn.disabled = false;
-          window.yuvomi?.showToast(err?.data?.error || t('common.errorGeneric'), 'danger');
+          reportError(err);
         }
       });
     },
   });
 }
+
+export const __test = { openTypeModal };
 
 export async function render(container) {
   _container = container;

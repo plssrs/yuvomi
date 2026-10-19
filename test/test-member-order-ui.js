@@ -13,6 +13,9 @@
  *          - die Liste steht in der Haushaltsreihenfolge, Ehemalige am Ende,
  *            ein lokal angehaengtes neues Mitglied im Alphabet der Unplatzierten.
  *
+ *        Dazu (R20): der Hinweis auf die Kinder-Startrechte in Anlege- und
+ *        Einladungsformular derselben Seite.
+ *
  *        NICHT hier: das Ziehen und die Pfeiltasten selbst. Beides braucht ein
  *        DOM, das Zeilen umhaengt; gefahren wurde es im Browser (PR-Text).
  * Ausfuehren: npm run test:member-order
@@ -148,4 +151,133 @@ test('wiring: drag and arrow keys share one persistence path, and the route take
   assert.match(source, /persistMemberOrder\(ctx\.container, ctx\.currentUser, ctx\.users, row\)/);
   assert.match(source, /api\.patch\('\/family\/members\/reorder', \{ order \}\)/);
   assert.match(source, /draggable: '\.settings-member--orderable'/);
+});
+
+// R20 (Kinder-Standards): wer ein Kind anlegt oder einlaedt, liest dabei, mit
+// welchen Rechten es startet. Der Hinweis steht nur bei der Rolle Kind, und nur
+// dann beschreibt er das Feld (ein per aria-describedby verwiesener Text wird
+// auch versteckt vorgelesen).
+test('R20: Anlegen und Einladen nennen die Kinder-Startrechte genau bei der Rolle Kind', () => {
+  for (const [html, selectId, hintId] of [
+    [family.addMemberFormHtml(), 'new-family-role', 'new-member-child-hint'],
+    [family.addInviteFormHtml(), 'invite-family-role', 'invite-child-hint'],
+  ]) {
+    assert.match(html, new RegExp(`<p class="form-hint" id="${hintId}" hidden>settings\\.childStartHint</p>`), `${hintId}: der Hinweis steht im Formular`);
+    const attrs = {};
+    const select = {
+      value: 'other',
+      listeners: [],
+      addEventListener(type, fn) { if (type === 'change') this.listeners.push(fn); },
+      setAttribute(name, value) { attrs[name] = value; },
+      removeAttribute(name) { delete attrs[name]; },
+    };
+    const hint = { id: hintId, hidden: true };
+    const panel = { querySelector: (sel) => (sel === `#${selectId}` ? select : sel === `#${hintId}` ? hint : null) };
+    family.bindChildStartHint(panel, selectId, hintId);
+    assert.equal(hint.hidden, true, 'Erwachsene: kein Hinweis');
+    assert.equal(attrs['aria-describedby'], undefined);
+    select.value = 'child';
+    select.listeners.forEach((fn) => fn());
+    assert.equal(hint.hidden, false, 'Kind: der Hinweis erscheint');
+    assert.equal(attrs['aria-describedby'], hintId, 'und beschreibt das Feld');
+    select.value = 'parent';
+    select.listeners.forEach((fn) => fn());
+    assert.equal(hint.hidden, true);
+    assert.equal(attrs['aria-describedby'], undefined, 'der Verweis geht mit dem Hinweis');
+  }
+});
+
+// -------------------------------------------------------------------------
+// #1997: eine spaete Erfolgsantwort schliesst nur ihren EIGENEN Dialog
+// -------------------------------------------------------------------------
+
+// Kommt die Antwort erst, nachdem der Nutzer den Dialog geschlossen und einen
+// anderen geoeffnet hat, darf das force-Schliessen nur den eigenen treffen. Ob
+// der Slot noch denselben Dialog haelt, entscheidet closeModal({ context }) in
+// components/modal.js (am echten Modul gemessen in test-modal-dead-time.js);
+// hier zaehlt die Verdrahtung: beide Speichern-Wege der Familienseite reichen
+// den Kontext von VOR der Anfrage hinein. Gefahren wird je Weg der echte
+// Submit-Handler an einem Attrappen-Panel; die Anfrage wechselt den Kontext.
+
+/** Oeffnet einen Dialog ueber den Modal-Stub; liefert den Submit des Formulars `formSel`. */
+async function familyDialog(oeffne, formSel, werte = {}) {
+  let opts = null;
+  globalThis.__openModal = (o) => { opts = o; };
+  try { await oeffne(); } finally { delete globalThis.__openModal; }
+  assert.ok(opts, 'der Dialog wurde geoeffnet');
+  const handlers = {};
+  const els = {};
+  const el = (sel) => {
+    if (!els[sel]) {
+      els[sel] = {
+        value: '', checked: false, hidden: false, disabled: false, required: false, textContent: '', dataset: {}, style: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        setAttribute() {}, removeAttribute() {}, getAttribute: () => null,
+        addEventListener(type, fn) { handlers[`${sel}:${type}`] = fn; },
+        querySelector: (inner) => el(inner), querySelectorAll: () => [], focus() {},
+        replaceChildren() {}, insertAdjacentHTML() {}, appendChild() {},
+        ...werte[sel],
+      };
+    }
+    return els[sel];
+  };
+  opts.onSave({ querySelector: el, querySelectorAll: () => [], addEventListener() {} });
+  return () => handlers[`${formSel}:submit`]({ preventDefault() {} });
+}
+
+test('#1997: Erfolg nach Dialogwechsel - Mitglied anlegen und bearbeiten schliessen nur mit dem Kontext von VOR der Anfrage', async () => {
+  const { auth } = await import('/api.js');
+  const vorher = { createUser: auth.createUser, updateUser: auth.updateUser, window: globalThis.window };
+  const toasts = [];
+  globalThis.window = { ...vorher.window, yuvomi: { showToast: (text, kind) => toasts.push([text, kind]) } };
+  const container = { querySelector: () => null, querySelectorAll: () => [] };
+  const users = [person(1, 'Mara', { role: 'admin' }), person(2, 'Zoe')];
+  const NEU = {
+    '#new-username': { value: 'zoe' }, '#new-display-name': { value: 'Zoe' }, '#new-member-password': { value: 'geheim-genug' },
+    '#new-avatar-color': { value: '#123456' }, '#new-family-role': { value: 'other' },
+  };
+  const BEARBEITET = {
+    '#edit-member-username': { value: 'u2' }, '#edit-member-display-name': { value: 'Zoe' },
+    '#edit-member-avatar-color': { value: '#123456' }, '#edit-member-family-role': { value: 'other' },
+  };
+  const WEGE = [
+    ['Mitglied anlegen', () => familyDialog(() => family.openAddMemberModal(container, users[0], [...users]), '#add-member-form', NEU)],
+    ['Mitglied bearbeiten', () => familyDialog(() => family.openEditMemberModal(users[1], users[0], [...users], container), '#edit-member-form', BEARBEITET)],
+  ];
+  try {
+    for (const [name, vorbereiten] of WEGE) {
+      let kontext = 'eigener-dialog';
+      const geschlossen = [];
+      const geschrieben = [];
+      globalThis.__apiStub = { get: async () => ({ data: {} }) };
+      const ausloesen = await vorbereiten();
+      toasts.length = 0;
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__closeModal = (opts) => { geschlossen.push(opts); };
+      const schreibe = (verb) => async () => {
+        geschrieben.push(verb);
+        kontext = 'ein-anderer-dialog';
+        return { user: person(2, 'Zoe') };
+      };
+      auth.createUser = schreibe('createUser');
+      auth.updateUser = schreibe('updateUser');
+      try {
+        await ausloesen();
+        assert.equal(geschrieben.length, 1, `${name}: der Weg schreibt`);
+        assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+        assert.equal(geschlossen.length, 1, `${name}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+        assert.equal(geschlossen[0].force, true, `${name}: force wie bisher`);
+        assert.equal(geschlossen[0].context, 'eigener-dialog',
+          `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+      } finally {
+        delete globalThis.__modalContextId;
+        delete globalThis.__closeModal;
+        delete globalThis.__apiStub;
+      }
+    }
+  } finally {
+    auth.createUser = vorher.createUser;
+    auth.updateUser = vorher.updateUser;
+    globalThis.window = vorher.window;
+  }
 });

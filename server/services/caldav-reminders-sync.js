@@ -16,6 +16,7 @@ import { parseVTODO } from './ics-parser.js';
 import { createCalDAVClient, supportsComponent } from '../utils/caldav-client.js';
 import { householdTimeZone, utcToWall } from '../utils/timezone.js';
 import { setItemTags, setTags } from '../utils/task-tags.js';
+import { syncTaskCompletion, recordCompletion, revokeCompletion } from './task-completions.js';
 import * as todoOutbound from './caldav-todo-outbound.js';
 import { runSerialized } from '../utils/sync-lock.js';
 
@@ -240,41 +241,151 @@ function updateReminderSelection(accountId, listUrl, { enabled, targetModule } =
 // ein gespiegelter Eintrag für spätere Änderungen und Löschungen unerreichbar
 // (#617). COALESCE, weil ein Abruf ohne URL den gespeicherten Wert nicht
 // entwerten darf.
-function upsertTask(todo, accountId, createdBy, objectUrl = null) {
-  const { date, time } = splitDue(todo.due, householdTimeZone(db.get()));
+function upsertTask(todo, accountId, createdBy, objectUrl = null, { completions = null } = {}) {
+  const d = db.get();
+  const { date, time } = splitDue(todo.due, householdTimeZone(d));
 
-  const existing = db.get().prepare(
-    `SELECT id, priority, status FROM tasks WHERE external_uid = ? AND external_source = 'caldav' AND external_account_id = ?`
-  ).get(todo.uid, accountId);
+  // Zeile und Tags in einer Transaktion. Der STATUS einer schon gespiegelten
+  // Zeile gehört nicht dazu: er wird zusammen mit seinem Erledigungseintrag in
+  // applySyncedCompletions geschrieben (#1836, siehe unten).
+  return d.transaction(() => {
+    const existing = d.prepare(
+      `SELECT id, priority, status FROM tasks WHERE external_uid = ? AND external_source = 'caldav' AND external_account_id = ?`
+    ).get(todo.uid, accountId);
 
-  const priority = mapVtodoPriority(todo.priority, existing?.priority);
-  const status   = mapVtodoStatus(todo, existing?.status);
+    const priority = mapVtodoPriority(todo.priority, existing?.priority);
+    const status   = mapVtodoStatus(todo, existing?.status);
 
-  let taskId;
-  if (existing) {
-    db.get().prepare(`
-      UPDATE tasks
-      SET title = ?, description = ?, priority = ?, status = ?, due_date = ?, due_time = ?,
-          external_object_url = COALESCE(?, external_object_url)
-      WHERE id = ?
-    `).run(todo.summary, todo.description, priority, status, date, time, objectUrl, existing.id);
-    taskId = existing.id;
-  } else {
-    // category bleibt beim Spalten-Default 'misc' (v114) - VTODO kennt keine
-    // Entsprechung, und CATEGORIES ist die Tag-Liste, nicht die Schublade.
-    const row = db.get().prepare(`
-      INSERT INTO tasks
-        (title, description, priority, status, due_date, due_time, created_by, external_uid, external_source, external_account_id, external_object_url)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'caldav', ?, ?)
-    `).run(todo.summary, todo.description, priority, status, date, time, createdBy, todo.uid, accountId, objectUrl);
-    taskId = row.lastInsertRowid;
-  }
+    let taskId;
+    if (existing) {
+      d.prepare(`
+        UPDATE tasks
+        SET title = ?, description = ?, priority = ?, due_date = ?, due_time = ?,
+            external_object_url = COALESCE(?, external_object_url)
+        WHERE id = ?
+      `).run(todo.summary, todo.description, priority, date, time, objectUrl, existing.id);
+      taskId = existing.id;
+    } else {
+      // category bleibt beim Spalten-Default 'misc' (v114) - VTODO kennt keine
+      // Entsprechung, und CATEGORIES ist die Tag-Liste, nicht die Schublade.
+      const row = d.prepare(`
+        INSERT INTO tasks
+          (title, description, priority, status, due_date, due_time, created_by, external_uid, external_source, external_account_id, external_object_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'caldav', ?, ?)
+      `).run(todo.summary, todo.description, priority, status, date, time, createdBy, todo.uid, accountId, objectUrl);
+      taskId = row.lastInsertRowid;
+    }
 
-  // CATEGORIES → Tags (#586). Der Server führt sie, also gewinnt er auch: eine
-  // lokale Bearbeitung, die noch aussteht, kommt hier gar nicht an - der
-  // Aufrufer überspringt dirty markierte Einträge (#617).
-  setTags(db.get(), taskId, todo.tags);
-  return taskId;
+    // Derselbe Erledigungseintrag wie beim Abhaken in Yuvomi (#1836): ohne ihn
+    // fehlte eine auf dem Telefon abgehakte Aufgabe im Verlauf und an der Wand
+    // ("heute erledigt"), und eine dort wieder geöffnete behielte ihren Eintrag.
+    // Keine Person - der Sync weiss nicht, wer abgehakt hat (Begründung an
+    // syncTaskCompletion).
+    //
+    // NUR FÜR EINE SCHON GESPIEGELTE ZEILE. Eine neu eingelesene, bereits
+    // erledigte Aufgabe ist kein Übergang, den hier jemand erlebt hat: der erste
+    // Abruf einer Liste brächte sonst jede je abgehakte Erinnerung auf einmal in
+    // den Verlauf - genau der Nachtrag, den #1836 ausschliesst.
+    //
+    // IM LAUF ERST NACH DER HIERARCHIE, UND MIT IHM DER STATUS (Review zu
+    // #1836). Ob die Zeile eine Teilaufgabe ist - und damit keinen Eintrag
+    // bekommt -, entscheidet erst applyTaskRelations nach allen Listen. Wer
+    // `completions` mitgibt (sync()), bekommt den Übergang dort hinein und
+    // spielt ihn mit applySyncedCompletions nach; ohne gilt er sofort. Der
+    // Status wartet mit, damit Status und Eintrag nur gemeinsam entstehen:
+    // stürbe der Lauf zwischen beiden, sähe der nächste "unverändert", und der
+    // Eintrag fehlte für immer. Bis zum Abschluss liest im Lauf nichts den
+    // neuen Status (Hierarchie, dann Übergänge, erst danach Prune und Push).
+    //
+    // JE AUFGABE EIN ÜBERGANG, DER LETZTE GEWINNT. Dieselbe UID darf in
+    // mehreren Listen stehen, und wie Titel und Tags bestimmt das zuletzt
+    // gelesene Objekt auch den Status. Jeder Upsert liest dabei den noch
+    // ungeschriebenen Status aus der Zeile: ein späteres Objekt, das ihn
+    // bestätigt, nimmt einen früher vorgemerkten Wechsel deshalb zurück.
+    //
+    // AUCH OHNE WECHSEL STEHT DIE ZEILE IN DER WARTESCHLANGE (#2078). Ändert
+    // der Lauf nur RELATED-TO, entscheidet die Hierarchie trotzdem über den
+    // Eintrag, und eine herausgelöste erledigte Aufgabe braucht dafür das
+    // COMPLETED genau dieses Objekts. Ein Eintrag mit gleichem alten und neuen
+    // Status ist kein Übergang; applySyncedCompletions gleicht ihn nur ab,
+    // wenn sich der Elternteil geändert hat.
+    if (existing) {
+      const id = Number(taskId);
+      const seen = { taskId: id, oldStatus: existing.status, newStatus: status, completedAt: pastOrNull(todo.completedAt) };
+      if (completions) completions.set(id, seen);
+      else if (existing.status !== status) applySyncedCompletions(d, [seen]);
+    }
+
+    // CATEGORIES → Tags (#586). Der Server führt sie, also gewinnt er auch: eine
+    // lokale Bearbeitung, die noch aussteht, kommt hier gar nicht an - der
+    // Aufrufer überspringt dirty markierte Einträge (#617).
+    setTags(d, taskId, todo.tags);
+    return taskId;
+  })();
+}
+
+/**
+ * Die Statuswechsel eines Laufs schreiben: Status UND Erledigungseintrag in
+ * einer Transaktion (#1836), nachdem die Hierarchie steht - recordCompletion
+ * fragt `parent_task_id`.
+ *
+ * Nur, wo die Zeile noch auf dem Status steht, den der Upsert gesehen hat, und
+ * keine lokale Bearbeitung auf ihren Push wartet: zwischen Upsert und hier
+ * liegen die Abrufe der übrigen Listen. Wer die Aufgabe in der Zeit in Yuvomi
+ * umgeschaltet oder bearbeitet hat, gewinnt wie sonst im Inbound (#617), und
+ * ihren Eintrag hat die Route schon richtig gestellt.
+ *
+ * NUR DIE HIERARCHIE GEÄNDERT (#2078). Für die Aufgaben in `reparented`
+ * (applyTaskRelations), deren Status der Lauf NICHT ändert, gilt dieselbe
+ * Regel wie beim Abhaken: Teilaufgaben stehen nie im Verlauf, also verliert
+ * eine untergeordnete ihren Eintrag. Eine herausgelöste erledigte Aufgabe
+ * bekommt ihn mit dem COMPLETED der Erinnerung; fehlt es oder ist es
+ * unbrauchbar, bleibt sie ohne - ein Eintrag mit der Laufzeit wäre ein
+ * Nachtrag, den #1836 schon beim ersten Abruf ausschliesst. Dieselben
+ * Schutzregeln wie für den Status: nur auf dem gesehenen Status, ohne
+ * wartenden Push.
+ *
+ * @param {Map|Array} pending       je Aufgabe der gesehene Stand aus upsertTask
+ * @param {Set<number>} [reparented] Aufgaben, deren parent_task_id der Lauf geändert hat
+ */
+function applySyncedCompletions(d, pending, reparented = null) {
+  // Der Lauf führt eine Map je Aufgabe, der Einzelaufruf eine Liste.
+  const entries = pending instanceof Map ? [...pending.values()] : pending;
+  if (!entries.length) return;
+  const write = d.prepare(`
+    UPDATE tasks SET status = ?
+     WHERE id = ? AND status = ? AND COALESCE(outbound_dirty, 0) = 0
+  `);
+  const untouched = d.prepare(`
+    SELECT parent_task_id FROM tasks
+     WHERE id = ? AND status = ? AND COALESCE(outbound_dirty, 0) = 0
+  `);
+  d.transaction(() => {
+    for (const { taskId, oldStatus, newStatus, completedAt } of entries) {
+      if (oldStatus === newStatus) {
+        if (!reparented?.has(taskId)) continue;
+        const row = untouched.get(taskId, oldStatus);
+        if (!row) continue;
+        if (row.parent_task_id != null) revokeCompletion(d, taskId);
+        else if (newStatus === 'done' && completedAt) {
+          recordCompletion(d, taskId, null, null, { source: 'caldav', completedAt });
+        }
+        continue;
+      }
+      if (write.run(newStatus, taskId, oldStatus).changes === 0) continue;
+      syncTaskCompletion(d, taskId, oldStatus, newStatus, null, null, { source: 'caldav', completedAt });
+    }
+  })();
+}
+
+/**
+ * Ein COMPLETED aus der Zukunft (Uhr des Telefons vorgestellt) wäre ein Haken,
+ * der erst noch passiert; dann gilt der Zeitpunkt des Laufs.
+ */
+function pastOrNull(iso) {
+  if (!iso) return null;
+  const at = Date.parse(iso);
+  return Number.isFinite(at) && at <= Date.now() ? iso : null;
 }
 
 /**
@@ -290,7 +401,14 @@ function upsertTask(todo, accountId, createdBy, objectUrl = null) {
  * gehängt statt fallen gelassen - flach unter dem falschen Kopf ist immer noch
  * eine Hierarchie, gar keine wäre der gemeldete Zustand.
  *
+ * Liefert die Aufgaben, deren `parent_task_id` sich dabei geändert hat: für
+ * sie stimmt der Erledigungseintrag womöglich nicht mehr (#2078,
+ * applySyncedCompletions). Der Lauf ruft das in einer eigenen Transaktion,
+ * damit ein Fehler mitten in der Schleife keine halbe Hierarchie hinterlässt,
+ * zu der die gemeldete Menge nicht passt.
+ *
  * @param {Map<string, {taskId: number, parentUid: string|null, childUids: string[]}>} seen
+ * @returns {Set<number>}
  */
 function applyTaskRelations(seen) {
   const idByUid = new Map([...seen].map(([uid, entry]) => [uid, entry.taskId]));
@@ -320,13 +438,15 @@ function applyTaskRelations(seen) {
   };
 
   const update = db.get().prepare('UPDATE tasks SET parent_task_id = ? WHERE id = ? AND parent_task_id IS NOT ?');
+  const changed = new Set();
   for (const [uid, entry] of seen) {
     const rootUid = parentUidOf.has(uid) ? rootOf(uid) : null;
     const parentId = rootUid ? idByUid.get(rootUid) ?? null : null;
     // Auch der NULL-Fall muss geschrieben werden: wer auf dem Server aus der
     // Unterliste gezogen wurde, ist sonst in Yuvomi für immer ein Kind.
-    update.run(parentId, entry.taskId, parentId);
+    if (update.run(parentId, entry.taskId, parentId).changes > 0) changed.add(Number(entry.taskId));
   }
+  return changed;
 }
 
 function upsertShoppingItem(sel, todo, accountId, objectUrl = null) {
@@ -334,8 +454,23 @@ function upsertShoppingItem(sel, todo, accountId, objectUrl = null) {
   const isChecked = todo.completed ? 1 : 0;
 
   const existing = db.get().prepare(
-    `SELECT id FROM shopping_items WHERE external_uid = ? AND external_source = 'caldav' AND external_account_id = ?`
+    `SELECT id, outbound_move FROM shopping_items WHERE external_uid = ? AND external_source = 'caldav' AND external_account_id = ?`
   ).get(todo.uid, accountId);
+
+  // DER ARTIKEL IST HIER UMGEZOGEN, SEIN OBJEKT NOCH NICHT (#1700). Der Abruf
+  // liest es am alten Platz und stellte die Zeile sonst dorthin zurück - der
+  // Server folgt hier der Zeile, nicht umgekehrt. Frisch an der Zeile gelesen,
+  // nicht aus dem Stand vom Anfang des Laufs: der Umzug kann eintreffen,
+  // während der Lauf noch den Server liest. Nur eine fehlende Adresse wird
+  // nachgetragen, ohne sie ist das Original nicht lesbar.
+  if (existing?.outbound_move) {
+    if (objectUrl) {
+      db.get().prepare(
+        'UPDATE shopping_items SET external_object_url = COALESCE(external_object_url, ?) WHERE id = ?'
+      ).run(objectUrl, existing.id);
+    }
+    return;
+  }
 
   let itemId;
   if (existing) {
@@ -430,6 +565,25 @@ async function sync(opts = {}) {
   return runSerialized('caldav-todo', 'sync', () => runSync(opts));
 }
 
+// Konto → Zahl der wartenden Aufträge, die zuletzt gemeldet wurde: im
+// Standard-Log steht der Zustand, wenn er sich ändert, nicht bei jedem Lauf.
+const reportedWaiting = new Map();
+
+/**
+ * Meldet, wie viele Löschaufträge dieses Kontos auf eine abgewählte Liste
+ * warten (#1884).
+ */
+function reportWaitingDeletions(account) {
+  const waiting = todoOutbound.deletionsWaitingForSelection(account.id).length;
+  const before = reportedWaiting.get(account.id) || 0;
+  reportedWaiting.set(account.id, waiting);
+  if (!waiting) return;
+  const line = `Account ${account.id} ("${account.name}"): ${waiting} pending deletion(s) wait for a reminder list that is not selected. `
+    + 'Nothing is deleted there while it is switched off; they are carried out once it is selected again and dropped if it no longer exists on the server.';
+  if (waiting !== before) log.info(line);
+  else log.debug(line);
+}
+
 async function runSync({ createClient: makeClient } = {}) {
   const accounts = getAllAccounts();
   if (accounts.length === 0) {
@@ -438,6 +592,11 @@ async function runSync({ createClient: makeClient } = {}) {
 
   // Client-Factory injizierbar (Tests), Default = echter tsdav-Client.
   const clientFactory = makeClient || createClient;
+  // Die Quelle einer Mitnahme (#1700) kann ein anderes Konto sein.
+  const clientFor = async (id) => {
+    const other = getAccountById(id);
+    return other ? todoOutbound.createTodoClient(other, clientFactory) : null;
+  };
 
   let totalItems       = 0;
   let totalPushed      = 0;
@@ -449,10 +608,27 @@ async function runSync({ createClient: makeClient } = {}) {
         SELECT * FROM caldav_reminder_selection WHERE account_id = ? AND enabled = 1
       `).all(account.id);
 
-      if (enabledLists.length === 0) continue;
+      // Ohne eingeschaltete Liste gibt es nichts abzurufen. Wartet aber ein
+      // Löschauftrag auf eine abgewählte (#1884), fragt der Lauf trotzdem die
+      // Auflistung ab: nur sie sagt, ob es die Liste noch gibt.
+      // Dasselbe für einen Umzug in eine abgewählte Liste (#1700).
+      const waitsForSelection = todoOutbound.deletionsWaitingForSelection(account.id).length > 0
+        || todoOutbound.movesWaitingForSelection(account.id) > 0;
+      if (enabledLists.length === 0 && !waitsForSelection) continue;
 
-      const client     = await clientFactory(account);
+      // Gezielte Anfragen nur an den Server dieses Kontos (`createTodoClient`).
+      const client     = await todoOutbound.createTodoClient(account, clientFactory);
       const serverCals  = await client.fetchCalendars();
+
+      if (enabledLists.length === 0) {
+        // Eine leere Auflistung sagt auch hier nichts.
+        if (serverCals.length > 0) {
+          todoOutbound.dropDeletionsOfMissingLists(account.id, serverCals.map((c) => c.url));
+          todoOutbound.returnMovesIntoMissingLists(account.id, serverCals.map((c) => c.url));
+        }
+        reportWaitingDeletions(account);
+        continue;
+      }
       // Der Server nennt KEINE Collection, obwohl Listen ausgewählt sind: das
       // ist eine unvollständige Antwort (ein Multistatus, der nur die
       // Home-Collection nennt oder jede Ressource mit 403 quittiert), kein
@@ -465,6 +641,12 @@ async function runSync({ createClient: makeClient } = {}) {
         );
         continue;
       }
+      // Löschaufträge für Listen, die der Server nicht mehr nennt, haben ihr
+      // Ziel erreicht (#1884). Vor dem Lesen der Aufträge für den Abruf unten.
+      todoOutbound.dropDeletionsOfMissingLists(account.id, serverCals.map((c) => c.url));
+      // Ein Umzug in eine Liste, die der Server nicht mehr nennt, geht zurück (#1700).
+      todoOutbound.returnMovesIntoMissingLists(account.id, serverCals.map((c) => c.url));
+
       const owner       = db.get().prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get();
       const createdBy   = owner ? owner.id : 1;
 
@@ -474,6 +656,10 @@ async function runSync({ createClient: makeClient } = {}) {
       // nicht die Listen-URL — ein Prune träfe sonst auch die Einträge der Liste, die
       // gerade nur wegen eines Server-Fehlers leer aussieht.
       const incompleteModules = new Set();
+
+      // Ein Umzug, dessen Zielliste gar keinen Platz auf einem Server mehr hat
+      // (#1700), wird zum Löschen am Server - vor dem Lesen der Aufträge.
+      todoOutbound.releaseStrandedShoppingMoves(account.id);
 
       // Ausstehende Rückrichtung einmal je Lauf und Modul (#617): eine lokal
       // gelöschte Aufgabe darf der Inbound nicht wieder anlegen, eine lokal
@@ -494,6 +680,9 @@ async function runSync({ createClient: makeClient } = {}) {
       // UID → lokale Aufgabe dieses Laufs, für die Hierarchie-Auflösung nach
       // allen Listen (#671). Nur Aufgaben: der Einkauf kennt keine Unterposten.
       const taskRelations = new Map();
+      // Statuswechsel dieses Laufs je Aufgabe (#1836), erst nach der Hierarchie
+      // geschrieben (applySyncedCompletions).
+      const completionTransitions = new Map();
 
       for (const sel of enabledLists) {
         const module = sel.target_module === 'shopping' ? 'shopping' : 'tasks';
@@ -518,14 +707,58 @@ async function runSync({ createClient: makeClient } = {}) {
           const todos = parseVTODO(obj.data || '');
           for (const todo of todos) {
             try {
+              // Für dieses Objekt steht die Notiz eines Uploads, der nie
+              // gebucht wurde (#1882) - gleich über welches Konto er lief.
+              // Dann ist es kein Eintrag wie jeder andere: wartet seine Zeile
+              // genau hier, wird es übernommen; sonst wird es weder
+              // importiert noch einer Zeile zugeordnet (gelöscht, anderes
+              // Ziel, woanders gespiegelt, oder sie wartet über ein anderes
+              // Konto), und es kommt auch nicht in den Index dieses Laufs -
+              // dieselbe UID kann rechtmässig in einer anderen Liste des
+              // Kontos liegen. Entfernt wird es von
+              // `releaseLeftoverTodoUploads`. Frisch gefragt: die Zeile kann
+              // gefallen sein, während dieser Lauf noch liest.
+              const unbooked = todoOutbound.isUnbookedOwnUpload(module, todo.uid, sel.list_url);
+              // Der eigene Upload, dessen Antwort verloren ging: in die noch
+              // lokale Zeile übernehmen statt eine zweite anzulegen; ihr
+              // lokaler Stand geht mit dem Outbound dieses Laufs hinauf. Nur
+              // für eine Zeile, die auf den Upload in GENAU diese Liste
+              // wartet - die UID kommt vom Server und weist nichts aus.
+              const adoptOwn = () => !!obj.url && todoOutbound.adoptOwnUpload(module, todo.uid, account.id, obj.url, {
+                listUrl: sel.list_url, targetListId: sel.target_list_id,
+              });
+              //
+              // Ein übersprungener Rest zählt NICHT als gesehen (#1905): er
+              // gehört zu keiner Zeile. Ist seine Zeile inzwischen in einer
+              // anderen Liste des Kontos Spiegel derselben UID und wurde sie
+              // dort auf dem Server gelöscht, hielte der Rest sie sonst fest -
+              // einen Lauf lang, und so lange der Server sein Entfernen
+              // ablehnt, bis zum Ende der Frist der Notiz.
+              // Die eine Ausnahme ist der Einkaufsartikel, der anderswo
+              // Spiegel derselben UID ist (#1700): fehlt seine Kopie dort,
+              // ist dieses Objekt das letzte, und die Zeile geht nach dem
+              // Prune zu ihm zurück (`confirmCarriedCopy`).
+              if (unbooked && !adoptOwn()) {
+                if (todoOutbound.leftoverHoldsCarriedItem(todo.uid, sel.list_url)) {
+                  seenByModule.shopping.push(todo.uid);
+                }
+                continue;
+              }
+
+              // Gesehen ist der Eintrag auch dann, wenn er weiter unten
+              // übersprungen wird (lokal gelöscht, lokal bearbeitet) - sonst
+              // würde der Prune ihn gleich wieder entfernen.
+              seenByModule[module].push(todo.uid);
+
               if (obj.url) {
                 objectsByModule[module].set(todo.uid, {
                   url: obj.url, etag: obj.etag, data: obj.data,
                 });
               }
-              // Gesehen ist der Eintrag auch dann, wenn er hier übersprungen
-              // wird - sonst würde der Prune ihn gleich wieder entfernen.
-              seenByModule[module].push(todo.uid);
+              if (unbooked) {
+                totalItems++;
+                continue;
+              }
 
               // Lokal gelöscht und noch nicht auf dem Server: nicht wieder
               // anlegen, sonst kehrt der Eintrag bei jedem Sync zurück.
@@ -534,15 +767,7 @@ async function runSync({ createClient: makeClient } = {}) {
               // darf sie nicht überschreiben.
               if (pendingByModule[module].dirty.has(todo.uid)) continue;
 
-              // Der eigene Upload, dessen Antwort verloren ging: die Zeile ist
-              // noch lokal, das Objekt liegt schon hier. In die bestehende
-              // Zeile übernehmen statt eine zweite anzulegen; ihr lokaler
-              // Stand geht mit dem Outbound dieses Laufs hinauf. Nur für eine
-              // Zeile, die auf den Upload in GENAU diese Liste wartet - die
-              // UID kommt vom Server und weist nichts aus (adoptOwnUpload).
-              if (obj.url && todoOutbound.adoptOwnUpload(module, todo.uid, account.id, obj.url, {
-                listUrl: sel.list_url, targetListId: sel.target_list_id,
-              })) {
+              if (adoptOwn()) {
                 totalItems++;
                 continue;
               }
@@ -550,7 +775,7 @@ async function runSync({ createClient: makeClient } = {}) {
               if (module === 'shopping') {
                 upsertShoppingItem(sel, todo, account.id, obj.url || null);
               } else {
-                const taskId = upsertTask(todo, account.id, createdBy, obj.url || null);
+                const taskId = upsertTask(todo, account.id, createdBy, obj.url || null, { completions: completionTransitions });
                 taskRelations.set(todo.uid, {
                   taskId,
                   parentUid: todo.parentUid || null,
@@ -567,13 +792,25 @@ async function runSync({ createClient: makeClient } = {}) {
 
       // Unteraufgaben verdrahten, sobald alle Listen des Kontos gelesen sind
       // (#671) - vorher ist die UID des Elternteils womöglich noch keine ID.
-      if (taskRelations.size > 0) {
-        try {
-          applyTaskRelations(taskRelations);
-        } catch (err) {
-          log.error(`Failed to apply VTODO relations for account ${account.id}:`, err.message);
+      // Hierarchie und Erledigungen in EINER Transaktion (#2078): stürbe der
+      // Lauf dazwischen, sähe der nächste den neuen Elternteil als
+      // unverändert, und der Eintrag bliebe für immer falsch. Jede Hälfte
+      // ist ein eigener Savepoint, ein Fehler in einer lässt die andere stehen.
+      db.get().transaction(() => {
+        let reparented = new Set();
+        if (taskRelations.size > 0) {
+          try {
+            reparented = db.get().transaction(() => applyTaskRelations(taskRelations))();
+          } catch (err) {
+            log.error(`Failed to apply VTODO relations for account ${account.id}:`, err.message);
+          }
         }
-      }
+        try {
+          applySyncedCompletions(db.get(), completionTransitions, reparented);
+        } catch (err) {
+          log.error(`Failed to record synced task completions for account ${account.id}:`, err.message);
+        }
+      })();
 
       // Prune locally-stored caldav items that vanished remotely.
       // Module mit einer nicht abgerufenen Liste werden übersprungen (#508).
@@ -592,7 +829,20 @@ async function runSync({ createClient: makeClient } = {}) {
         if (incompleteModules.has('shopping')) {
           log.warn(`Account ${account.id}: a reminder list could not be fetched, skipping shopping deletion.`);
         } else {
-          pruneRemoved(db.get(), 'shopping_items', account.id, seenByModule.shopping);
+          // Ein wartender Umzug, dessen Objekt in einer nicht abgerufenen
+          // Liste liegt (#1700), ist nicht "auf dem Server gelöscht".
+          //
+          // NUR ZUSÄTZLICH zu dem, was der Server geliefert hat. Hat er nichts
+          // geliefert, bleibt die Liste leer und der Leer-Guard von
+          // `pruneRemoved` (#508) greift: eine einzige hier ergänzte UID
+          // machte sonst aus "nichts gesehen" ein "alles andere ist fort", und
+          // der Prune räumte jeden Einkaufsartikel des Kontos ab.
+          // Scheitert das Lesen der wartenden Umzüge, geht der Fehler hoch und
+          // dieser Lauf prunt gar nicht - es gibt hier keinen leeren Ersatzwert.
+          const shielded = seenByModule.shopping.length
+            ? todoOutbound.uidsOfMovesFromUnfetchedLists(account.id, enabledLists.map((s) => s.list_url))
+            : [];
+          pruneRemoved(db.get(), 'shopping_items', account.id, [...seenByModule.shopping, ...shielded]);
         }
       }
 
@@ -618,6 +868,18 @@ async function runSync({ createClient: makeClient } = {}) {
         } catch (err) {
           log.error(`Outbound VTODO changes failed for account ${account.id} (${module}):`, err.message);
         }
+      }
+
+      reportWaitingDeletions(account);
+
+      // Die Reste nie bestätigter Uploads entfernen (#1882). Nach dem Abruf,
+      // der sie nicht importiert hat, und vor den Uploads: eine Zeile mit
+      // neuem Ziel in diesem Konto geht so nicht neben ihren Rest.
+      try {
+        const cleared = await todoOutbound.releaseLeftoverTodoUploads(client, account.id, { clientFor });
+        if (cleared) log.info(`${cleared} leftover(s) of unconfirmed uploads removed from the server.`);
+      } catch (err) {
+        log.error(`Removing leftovers of unconfirmed uploads failed for account ${account.id}:`, err.message);
       }
 
       // Hier angelegte Aufgaben hochladen (#695). Bewusst als LETZTER Schritt:
@@ -661,6 +923,30 @@ async function runSync({ createClient: makeClient } = {}) {
         if (created) log.info(`${created} locally created shopping item(s) uploaded to the server.`);
       } catch (err) {
         log.error(`Uploading local shopping items failed for account ${account.id}:`, err.message);
+      }
+
+      // Umgezogene Einkaufsartikel nehmen ihr Objekt mit (#1700). Ebenfalls
+      // nach dem Prune: die Zeile zeigt danach auf ein Objekt, das dieser Lauf
+      // in der neuen Liste noch nicht gelesen hat.
+      try {
+        const targets = db.get().prepare(`
+          SELECT list_url, target_list_id FROM caldav_reminder_selection
+           WHERE account_id = ? AND enabled = 1 AND target_module = 'shopping' AND target_list_id IS NOT NULL
+        `).all(account.id);
+        const lists = new Map(
+          targets.map((s) => [s.list_url, serverCals.find((c) => c.url === s.list_url)]).filter(([, cal]) => cal)
+        );
+        const carried = await todoOutbound.processPendingShoppingMoves(
+          client,
+          account.id,
+          targets.map((s) => ({ listUrl: s.list_url, targetListId: s.target_list_id })),
+          lists,
+          { clientFor }
+        );
+        totalPushed += carried;
+        if (carried) log.info(`${carried} moved shopping item(s) carried to their new list on the server.`);
+      } catch (err) {
+        log.error(`Carrying moved shopping items failed for account ${account.id}:`, err.message);
       }
 
       db.get().prepare('UPDATE caldav_accounts SET last_sync = ? WHERE id = ?')
@@ -713,6 +999,8 @@ function getStatus() {
 export {
   mapVtodoPriority,
   mapVtodoStatus,
+  upsertTask,
+  applySyncedCompletions,
   splitDue,
   applyTaskRelations,
   getReminderLists,

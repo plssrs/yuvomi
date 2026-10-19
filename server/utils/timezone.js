@@ -41,8 +41,12 @@ export function isValidTimeZone(zone) {
 export function serverTimeZone() {
   const envTz = (process.env.TZ || '').trim();
   if (envTz && isValidTimeZone(envTz)) return envTz;
+  // Auch die System-Zone wird geprüft: ICU meldet für ein TZ, das es nicht
+  // kennt, je nach Plattform `Etc/Unknown` (Windows), und diesen Namen lehnt
+  // Intl.DateTimeFormat selbst als Zone ab.
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const systemTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return isValidTimeZone(systemTz) ? systemTz : 'UTC';
   } catch { return 'UTC'; }
 }
 
@@ -201,6 +205,73 @@ function readStoredInstant(value, tz, toUTC) {
 }
 
 /**
+ * Ein gespeicherter Wert als UTC-Zeitpunkt, fuer alles, was ihn auf die
+ * Wanduhr einer SERIENZONE (`tzid`) umrechnet (#1993).
+ *
+ * Eine eingelesene Serie traegt ihre `tzid`. Wird sie aus dem Formular
+ * gespeichert, schreibt PUT die Wanduhr-Ziffern des HAUSHALTS (`to: 'wall'`),
+ * die `tzid` bleibt stehen. Bis hierher las jede Stelle, die daraus die
+ * Wanduhr der Serienzone machte, die Ziffern mit `new Date()` - in der Zone
+ * des PROZESSES: derselbe Datensatz ergab unter TZ=UTC und TZ=Europe/Berlin
+ * zwei verschiedene Serien. Gemeint ist die Uhr, in der die Ziffern
+ * geschrieben wurden, dieselbe, in der `storedToInstantMs()` sie liest.
+ *
+ * Ein Wert mit eigener Zone kommt unveraendert zurueck.
+ *
+ * DIE ZONE IST PFLICHT. Fehlt sie bei zonenlosen Ziffern, wirft die Funktion:
+ * ein stiller Rueckfall waere wieder die Prozesszone, also genau der Fehler.
+ * Jeder Aufrufer hat die Haushaltszone zur Hand (`householdTimeZone(db)`).
+ * @param {string} value          Wert aus start_datetime/end_datetime
+ * @param {string} householdZone  IANA-Zone des Haushalts (`householdTimeZone`)
+ * @returns {string|null} Zeitpunkt, oder null bei unlesbarem Wert
+ */
+export function storedToInstantIso(value, householdZone) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  if (hasExplicitZone(raw)) return Number.isNaN(Date.parse(raw)) ? null : raw;
+  if (!isValidTimeZone(householdZone)) {
+    throw new TypeError(`storedToInstantIso(): "${raw}" carries no zone, and no household zone was passed to read it in.`);
+  }
+  const ms = storedToInstantMsPrecise(raw, householdZone);
+  return ms === null ? null : new Date(ms).toISOString().replace('.000Z', 'Z');
+}
+
+/**
+ * Die Wanduhr eines gespeicherten Werts in der Serienzone `tzid` (#1993):
+ * `utcToWall()` fuer beide Speicherformen. Zonenlose Ziffern werden zuerst in
+ * der Haushaltszone gelesen (`storedToInstantIso`), nie in der Prozesszone.
+ * @param {string} value
+ * @param {string} tzid           IANA-Zone der Serie
+ * @param {string} householdZone  IANA-Zone des Haushalts
+ * @returns {{ date: string, time: string }|null}
+ */
+export function storedToWall(value, tzid, householdZone) {
+  const iso = storedToInstantIso(value, householdZone);
+  return iso ? utcToWall(iso, tzid) : null;
+}
+
+/**
+ * Liegt der Tag, der im gespeicherten Start STEHT, neben dem Ortstag der
+ * Serienzone? Das `zonenUnsicher` der Expansion und ihrer Nachbarn (#549,
+ * #985) - eine Formel fuer alle, damit sie dieselbe Antwort geben.
+ *
+ * Gefragt wird der Text, weil die Fragenden mit dessen Datumsteil
+ * weiterrechnen (`hasAnyOccurrence`, `seriesStartFor`). Die Wanduhr daneben
+ * kommt aus `storedToWall()` und haengt so nie an der Prozesszone (#1993).
+ * Ohne `tzid` gibt es keine zweite Uhr: false.
+ * @param {string} value
+ * @param {string|null} tzid
+ * @param {string} householdZone
+ * @returns {boolean}
+ */
+export function storedDayDiffersFromSeriesDay(value, tzid, householdZone) {
+  if (!tzid) return false;
+  const raw = String(value ?? '');
+  const wall = storedToWall(raw, tzid, householdZone);
+  return !(wall && wall.date === raw.slice(0, 10));
+}
+
+/**
  * `todayKey` um `days` Tage verschoben - reine UTC-Arithmetik auf dem
  * Datums-Key, damit die Verschiebung nicht ihrerseits über eine DST-Grenze
  * kippt. Zwei aufeinanderfolgende Kalendertage liegen nicht immer 24 h
@@ -318,9 +389,11 @@ function offsetMinutesAt(utcMs, tzid) {
  * also nicht eindeutig.
  *
  * ZWEI FASSUNGEN, NICHT EINE GEAENDERTE: `localToUTC()` bleibt, wie es ist -
- * ICS-Parser, Expansion und Outbound verlassen sich auf sein exaktes
+ * ICS-Parser und Outbound verlassen sich auf sein exaktes
  * Ein-Durchgang-Verhalten, und eine Umstellung dort waere eine andere Frage mit
- * anderen Tests. Wer die tatsaechliche Minute braucht (eine Erinnerung, die eine
+ * anderen Tests. Die Serien-Expansion rechnet die Zeitpunkte ihrer Vorkommen
+ * seit #2034 ueber `localToUTCOccurrence()` (unten); nur ihr Tagesschluessel
+ * bleibt bis zur Umstellung des Schluesselformats auf `localToUTC()`. Wer die tatsaechliche Minute braucht (eine Erinnerung, die eine
  * Stunde zu frueh oder spaet feuert, ist keine Erinnerung mehr), nimmt diese
  * hier: der Schichtplan-Sync (#786) und der Erinnerungspfad des Kalenders
  * (#1300).
@@ -377,6 +450,51 @@ export function localToUTCPrecise(localStr, tzid) {
   // spaetere - das Addieren schiebt dann um eine volle Stunde zu weit.
   // Gemessen fuer 2026-03-08T02:30 in America/New_York: 04:30 EDT statt 03:30.
   return new Date(Math.max(guessA, guessB)).toISOString().replace('.000Z', 'Z');
+}
+
+/**
+ * Wanduhr einer Serie -> Zeitpunkt eines Vorkommens, nach RFC 5545 (#2034).
+ *
+ * Die Serien-Expansion (`expandRecurringEvents`, `expandRRULE`) schreibt eine
+ * Wanduhrzeit Tag fuer Tag fort und braucht je Vorkommen den Zeitpunkt. Mit
+ * `localToUTC()` stand ein Vorkommen am Umstellungstag eine Stunde daneben:
+ * Europe/Berlin 01:30 am 25.03.2035 kam als 23:30Z des Vortags heraus statt
+ * 00:30Z (der Offset wird an der falschen Stelle gelesen, siehe oben). Hier
+ * gilt EINE Uhr mit zwei festgenagelten Regeln fuer die Stellen, an denen es
+ * die Wanduhrzeit nicht genau einmal gibt (RFC 5545, 3.3.5):
+ *
+ * - LUECKE (Fruehjahr, die Wanduhrzeit gibt es nicht): um die Lueckenbreite
+ *   nach vorn. Berlin 02:30 am 25.03.2035 -> 03:30 CEST = 01:30Z. Das liefert
+ *   `localToUTCPrecise()` schon, fuer beide Vorzeichen des Offsets.
+ * - DOPPELSTUNDE (Herbst, die Wanduhrzeit gibt es zweimal): das ERSTE
+ *   Auftreten. Berlin 02:30 am 28.10.2035 -> 02:30 CEST = 00:30Z.
+ *   `localToUTCPrecise()` waehlt hier je nach Vorzeichen des Offsets: oestlich
+ *   von UTC die spaetere Lage (01:30Z), westlich die fruehere. Deshalb wird
+ *   hier nachgefragt, ob es eine fruehere Lage mit derselben Wanduhr gibt.
+ *
+ * `localToUTCPrecise()` selbst bleibt, wie es ist: seine anderen Aufrufer
+ * (Erinnerungen, Schichtplan, Haushalt) sind eine eigene Frage.
+ *
+ * @param {string} localStr  'YYYY-MM-DDTHH:mm:ss[.sss]' ohne Offset
+ * @param {string} tzid      IANA-Zone
+ * @returns {string} UTC-ISO mit 'Z' (oder localStr bei ungueltiger Eingabe)
+ */
+export function localToUTCOccurrence(localStr, tzid) {
+  const precise = localToUTCPrecise(localStr, tzid);
+  const ms = Date.parse(precise);
+  const naiveMs = Date.parse(`${localStr}Z`);
+  if (!hasExplicitZone(precise) || Number.isNaN(ms) || Number.isNaN(naiveMs)) return precise;
+  const offsetHere = offsetMinutesAt(ms, tzid);
+  // Liegt die Wanduhr in einer Doppelstunde, gab es kurz vor `ms` einen
+  // groesseren Offset. Drei Stunden decken jede heutige Umstellung ab.
+  const offsetBefore = offsetMinutesAt(ms - 3 * 3600000, tzid);
+  if (offsetHere == null || offsetBefore == null || offsetBefore <= offsetHere) return precise;
+  const earlier = naiveMs - offsetBefore * 60000;
+  // Rundlauf: die fruehere Lage zaehlt nur, wenn dort wirklich dieser Offset galt.
+  if (earlier < ms && offsetMinutesAt(earlier, tzid) === offsetBefore) {
+    return new Date(earlier).toISOString().replace('.000Z', 'Z');
+  }
+  return precise;
 }
 
 /**

@@ -1,4 +1,5 @@
 import express from 'express';
+import birthdayFeedRouter from './birthday-feed.js';
 import { createLogger } from '../logger.js';
 import * as db from '../db.js';
 import { collectErrors, date as validateDate, oneOf, str, MAX_SHORT, MAX_TEXT, MAX_TITLE } from '../middleware/validate.js';
@@ -15,6 +16,7 @@ import {
 
 const log = createLogger('Birthdays');
 const router = express.Router();
+router.use('/feed', birthdayFeedRouter);
 const MAX_PHOTO_LENGTH = 6_990_507; // ~5 MB raw image in base64
 const PHOTO_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 
@@ -295,7 +297,7 @@ router.put('/:id', (req, res) => {
     const userId = req.authUserId || req.session.userId;
     const id = parseInt(req.params.id, 10);
     const existing = loadBirthday(id);
-    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404, reason: 'birthdays_birthday_not_found' });
 
     const checks = [];
     if (req.body.name !== undefined) checks.push(str(req.body.name, 'Name', { max: MAX_TITLE, required: false }));
@@ -349,7 +351,7 @@ router.delete('/:id', (req, res) => {
     const userId = req.authUserId || req.session.userId;
     const id = parseInt(req.params.id, 10);
     const existing = loadBirthday(id);
-    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404 });
+    if (!existing) return res.status(404).json({ error: 'Birthday not found.', code: 404, reason: 'birthdays_birthday_not_found' });
 
     db.transaction(() => {
       deleteBirthdayArtifacts(db.get(), existing);

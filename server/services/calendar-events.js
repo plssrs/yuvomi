@@ -5,7 +5,11 @@
  */
 
 import { nextOccurrence, parseRRule, matchesRRuleByday, untilInstantMs } from './recurrence.js';
-import { hasExplicitZone, localToUTC, utcToWall } from '../utils/timezone.js';
+import {
+  hasExplicitZone, householdTimeZone, localToUTC, localToUTCOccurrence, shiftDateKey,
+  storedToInstantIso, utcToWall,
+} from '../utils/timezone.js';
+import { personAvatarUrlSql } from './person-avatar.js';
 
 const DEFAULT_EXPANSION_ITERATIONS = 1000;
 export const MAX_EXPANSION_ITERATIONS = 100000;
@@ -14,7 +18,7 @@ export const MAX_EXPANSION_ITERATIONS = 100000;
 export const ASSIGNED_USERS_SQL = `(
   SELECT json_group_array(json_object(
     'id', u.id, 'display_name', u.display_name, 'color', u.avatar_color,
-    'avatar_data', u.avatar_data
+    'avatar_data', ${personAvatarUrlSql('u')}
   ))
   FROM event_assignments ea JOIN users u ON u.id = ea.user_id
   WHERE ea.event_id = e.id
@@ -77,6 +81,20 @@ export function loadEventExceptions(d, eventIds) {
   return map;
 }
 
+/**
+ * Die Haushaltszone, wenn die Expansion sie fuer DIESE Zeile braucht - sonst
+ * null (#1993). Gebraucht wird sie nur bei einem getimten, zonenlosen Start
+ * neben einer `tzid`; Leser, die Zeile fuer Zeile aufloesen, sparen so das
+ * `SELECT` auf `sync_config` fuer jede andere.
+ * @param {object} database  better-sqlite3-Connection
+ * @param {object} event     Zeile aus `calendar_events`
+ * @returns {string|null}
+ */
+export function seriesReadingZone(database, event) {
+  if (!event?.tzid || event.all_day || hasExplicitZone(event.start_datetime)) return null;
+  return householdTimeZone(database);
+}
+
 // --------------------------------------------------------
 // RRULE-Expansion: alle Vorkommen eines wiederkehrenden Events
 // innerhalb [from, to] generieren (inklusive beider Grenzen).
@@ -89,7 +107,19 @@ export function loadEventExceptions(d, eventIds) {
  * @param {Map<number, Set<string>>?} exceptionsByEvent  event.id → Set ausgenommener
  *        Instanz-Daten (YYYY-MM-DD); diese Vorkommen werden übersprungen (EXDATE, #489)
  * @param {{includeRecurrenceIdentity?: boolean, maxIterations?: number,
- *   maxOccurrencesPerSeries?: number, occurrenceFilter?: function}} [options]
+ *   maxOccurrencesPerSeries?: number, occurrenceFilter?: function,
+ *   householdZone?: string, windowZone?: string}} [options]
+ *        householdZone: Zone des Haushalts (`householdTimeZone(db)`), in der
+ *        zonenlose Start-Ziffern neben einer `tzid` gelesen werden (#1993).
+ *        Der Aufrufer reicht sie herein, die Expansion kennt keine Datenbank;
+ *        Pflicht fuer eine solche Zeile: fehlt sie, wirft die Expansion
+ *        (`storedToInstantIso`), statt still in der Prozesszone zu lesen.
+ *        windowZone: die Zone, in der [from, to] gemeint sind - bei jedem
+ *        LESER die Haushaltszone (#1999). Dann zaehlt fuer eine Serie mit
+ *        eigener Zone der Haushaltstag ihres Vorkommens, nicht ihr eigener.
+ *        Ohne sie bleibt das Fenster in Schleifentagen; so fragt die
+ *        Identitaetssuche der Einzelvorkommen, deren Fenster in
+ *        Schluesseltagen steht.
  * @returns {object[]}  Expandiertes, sortiertes Array
  */
 export function expandRecurringEvents(
@@ -100,6 +130,7 @@ export function expandRecurringEvents(
   {
     includeRecurrenceIdentity = false, maxIterations = DEFAULT_EXPANSION_ITERATIONS,
     maxOccurrencesPerSeries = null, occurrenceFilter = null,
+    householdZone = null, windowZone = null,
   } = {},
 ) {
   const result = [];
@@ -116,24 +147,45 @@ export function expandRecurringEvents(
       continue;
     }
 
+    const isAllDay     = !!event.all_day;
+    /* ZONENLOSE ZIFFERN NEBEN EINER TZID SIND WANDUHR DES HAUSHALTS (#1993).
+     *
+     * So entsteht die Zeile: eine eingelesene Serie wird aus dem Formular
+     * gespeichert, PUT schreibt die Ziffern des Haushalts (`to: 'wall'`), die
+     * `tzid` bleibt. Alles darunter las den Start mit `new Date()` und
+     * `utcToWall()`, also in der Zone des PROZESSES - dieselbe Zeile ergab
+     * unter TZ=UTC als letztes Vorkommen 23:30Z, unter TZ=Europe/Berlin 21:30Z.
+     *
+     * Hier wird der Start deshalb EINMAL zum Zeitpunkt, in der Haushaltszone
+     * gelesen, und der Rest der Funktion rechnet auf diesem Zeitpunkt weiter:
+     * Wanduhr der Serienzone, UTC-Tag fuer Identitaet und EXDATE, Dauer. Ohne
+     * `tzid` bleibt es beim Bisherigen: dort gibt es keine zweite Uhr, die
+     * Ziffern laufen als Wanduhr durch und Start und Ende lesen dieselbe Zone. */
+    const zonedNaive = !!event.tzid && !isAllDay && !hasExplicitZone(event.start_datetime);
+    const startText = zonedNaive
+      ? (storedToInstantIso(event.start_datetime, householdZone) ?? event.start_datetime)
+      : event.start_datetime;
+    const endText = zonedNaive && event.end_datetime
+      ? (storedToInstantIso(event.end_datetime, householdZone) ?? event.end_datetime)
+      : event.end_datetime;
+
     // Dauer des Events in ms (für End-Zeit-Berechnung der Instanzen)
-    const startMs    = new Date(event.start_datetime).getTime();
-    const endMs      = event.end_datetime ? new Date(event.end_datetime).getTime() : null;
+    const startMs    = new Date(startText).getTime();
+    const endMs      = endText ? new Date(endText).getTime() : null;
     const durationMs = endMs !== null ? endMs - startMs : null;
     // Duration in days for all-day events (for date-only end calculation)
-    const isAllDay     = !!event.all_day;
     const durationDays = isAllDay && durationMs !== null ? Math.round(durationMs / 86400000) : 0;
 
     // Original-Zeit-Teil erhalten (z.B. 'T14:30:00' oder '' bei All-Day)
-    const timeSuffix = event.start_datetime.slice(10);
+    const timeSuffix = startText.slice(10);
 
     // DST-korrekte Expansion: bei bekannter TZID (CalDAV/Apple-Serie) pro Vorkommen
     // die lokale Wanduhrzeit des Masters neu nach UTC rechnen, statt den festen
     // UTC-Suffix zu wiederholen (sonst driftet die Uhrzeit über die Sommer-/
     // Winterzeit-Grenze, #549). Nur für Tagtermine, deren lokales Datum == UTC-Datum
     // ist (kein Mitternachts-Überlauf) - sonst alte Fixe-Suffix-Logik.
-    const wall = (event.tzid && !isAllDay) ? utcToWall(event.start_datetime, event.tzid) : null;
-    const tzAware = wall && wall.date === event.start_datetime.slice(0, 10);
+    const wall = (event.tzid && !isAllDay) ? utcToWall(startText, event.tzid) : null;
+    const tzAware = wall && wall.date === startText.slice(0, 10);
     // Einmal bestimmt, an beide Stellen gereicht: Filter UND Berechnung muessen
     // dieselbe Antwort bekommen, sonst ist der Schutz halb.
     const zonenUnsicher = !!event.tzid && !tzAware;
@@ -166,15 +218,50 @@ export function expandRecurringEvents(
     // DTSTART ist zugleich Startpunkt und ANKER: ohne ihn leitet nextOccurrence
     // den gemeinten Tag aus dem vorigen Vorkommen ab, und eine Klemmung in einem
     // kurzen Monat wuerde damit festgeschrieben (#978).
-    const seriesStartUtc = event.start_datetime.slice(0, 10);
+    const seriesStartUtc = startText.slice(0, 10);
     const seriesStart = lokalRechnen ? wall.date : seriesStartUtc;
 
-    /** Der UTC-Zeitpunkt eines Vorkommens - im lokalen Modus zurueckgerechnet. */
-    const instantFuer = (tag) => (lokalRechnen
-      ? localToUTC(`${tag}T${wall.time}`, event.tzid)
-      : (tzAware ? localToUTC(`${tag}T${wall.time}`, event.tzid) : tag + timeSuffix));
-    /** Der UTC-TAG eines Vorkommens - fuer Fenster, EXDATE und Ausgabe. */
-    const utcTagFuer = (tag) => (lokalRechnen ? String(instantFuer(tag)).slice(0, 10) : tag);
+    /** Der UTC-Zeitpunkt eines Vorkommens - im lokalen Modus zurueckgerechnet.
+     *  EINE Uhr fuer Expansion und Abo-Pfad (#2034): `localToUTCOccurrence`
+     *  rechnet am Umstellungstag richtig und legt Luecke und Doppelstunde fest. */
+    const instantFuer = (tag) => ((lokalRechnen || tzAware)
+      ? localToUTCOccurrence(`${tag}T${wall.time}`, event.tzid)
+      : tag + timeSuffix);
+    /** Der UTC-TAG eines Vorkommens - fuer Fenster, EXDATE und Ausgabe.
+     *
+     *  DER SCHLUESSEL BLEIBT BEWUSST AUF DER ALTEN UHR (`localToUTC`), bis das
+     *  Schluesselformat selbst umgestellt wird (#2034, Schritt 4). Mit der neuen
+     *  Uhr wanderte er an genau den Umstellungstagen um einen Tag (gemessen:
+     *  Europe/Berlin 01:30, Start im Sommer: 2035-10-28 -> 2035-10-27 und
+     *  2035-03-24 -> 2035-03-25), und eine dort schon abgelegte Ausnahme,
+     *  ein verknuepftes Einzelvorkommen oder ein importiertes EXDATE (das der
+     *  Parser mit derselben alten Uhr auf den Tag bringt) traefe ihr Vorkommen
+     *  nicht mehr. Der Zeitpunkt stimmt jetzt, die Identitaet ist die von main. */
+    const utcTagFuer = (tag) => (lokalRechnen
+      ? String(localToUTC(`${tag}T${wall.time}`, event.tzid)).slice(0, 10)
+      : tag);
+
+    /* DAS FENSTER IST IN HAUSHALTSTAGEN GEMEINT, DIE SCHLEIFE NICHT (#1999).
+     *
+     * Bei einer Serie mit eigener Zone laeuft `currentDate` auf dem Tag dieser
+     * Zone (oben), die Leser bilden [from, to] aber aus der Haushaltszone
+     * (`todayKey()`, Anzeigetage). Verglichen wurden die beiden direkt: Haushalt
+     * Berlin, Serie Los Angeles 23:30 - das Vorkommen vom LA-11.06. ist in
+     * Berlin der 12.06. 08:30, fiel aber aus einem Fenster ab dem 12.06., und
+     * die Suche nannte den Termin eine Woche spaeter. Andersherum (Tokio 01:00)
+     * stand ein Vorkommen von gestern als naechster Termin da.
+     *
+     * Nennt der Leser die Zone seines Fensters, fragt das Fenster deshalb nach
+     * dem Haushaltstag des Vorkommens - nur dort, wo das Vorkommen einen
+     * Zeitpunkt hat (`instantFuer` rechnet ueber die Serienzone). Zonenlose und
+     * ganztaegige Serien laufen schon auf dem Tag, den das Fenster meint.
+     *
+     * Die Schleife laeuft dafuer zwei Tage ueber `to` hinaus: weiter als zwei
+     * Kalendertage koennen zwei Zonen nicht auseinanderliegen (-12 bis +14).
+     * Das Fenster selbst bleibt exakt. NUR das Fenster: Schluessel, EXDATE und
+     * Ausgabe bleiben, wie sie sind (`utcTagFuer`, #2034 Schritt 4). */
+    const fensterZone = windowZone && (lokalRechnen || tzAware) ? windowZone : null;
+    const schleifenEnde = fensterZone ? shiftDateKey(to, 2) : to;
 
     let currentDate = seriesStart; // YYYY-MM-DD, lokal oder UTC je nach Modus
     let iterations  = 0;
@@ -186,11 +273,11 @@ export function expandRecurringEvents(
     const maxCount   = parsedRule?.count ?? null;
     // UNTIL ALS ZEITPUNKT, WO ES EINER IST (#1269). Null heisst "nur als Tag
     // genannt" - dann bleibt es beim groben Tagesgatter in `nextOccurrence`.
-    const untilMs    = untilInstantMs(parsedRule, { tzid: event.tzid, toUTC: localToUTC });
+    const untilMs    = untilInstantMs(parsedRule, { tzid: event.tzid, toUTC: localToUTCOccurrence });
     let   occurrence = 0;
     let accepted = 0;
 
-    while (currentDate <= to && iterations < iterationLimit) {
+    while (currentDate <= schleifenEnde && iterations < iterationLimit) {
       iterations++;
 
       // BYDAY-FILTER VOR DEM ZAEHLEN, EXDATE DANACH - die beiden sehen gleich
@@ -252,15 +339,24 @@ export function expandRecurringEvents(
         continue;
       }
 
+      // Der Tag, an dem das Fenster dieses Vorkommen sieht (#1999, oben).
+      let fensterTag = currentDate;
+      if (fensterZone) {
+        occStart = occStart ?? instantFuer(currentDate);
+        fensterTag = utcToWall(occStart, fensterZone)?.date ?? currentDate;
+        // Die Vorkommen sind aufsteigend: hinter `to` kommt keins mehr hinein.
+        if (fensterTag > to) break;
+      }
+
       // For multi-day events, check if the instance end reaches into [from, to]
-      let instanceEnd = currentDate;
+      let instanceEnd = fensterTag;
       if (isAllDay && durationDays > 0) {
         const d = new Date(currentDate + 'T00:00:00');
         d.setDate(d.getDate() + durationDays);
         instanceEnd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
       }
 
-      if (currentDate >= from || instanceEnd >= from) {
+      if (fensterTag >= from || instanceEnd >= from) {
         const newStart = occStart ?? instantFuer(currentDate);
         let newEnd = event.end_datetime;
         if (durationMs !== null) {
@@ -276,7 +372,7 @@ export function expandRecurringEvents(
              * Gefragt wird `newStart`, nicht `timeSuffix`: der Suffix beschreibt
              * den Start des MASTERS, `newStart` ist der dieses Vorkommens - und
              * die beiden haben nicht dieselbe Form. Bei bekannter TZID baut
-             * `instantFuer()` den Start ueber `localToUTC()`, also mit `Z`,
+             * `instantFuer()` den Start ueber `localToUTCOccurrence()`, also mit `Z`,
              * waehrend der Master seinen urspruenglichen Offset traegt
              * (`T15:25:00-04:00` aus Google). Die alte Frage traf auf beides
              * nicht zu und schickte das Ende in den Wanduhr-Zweig darunter, der

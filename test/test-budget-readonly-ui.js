@@ -189,6 +189,30 @@ test('Buchungszeile mit `budget: read`: jede Handlung geht, die Zeile oeffnet di
   });
 });
 
+test('Kategorie- und Unterkategoriefilter bleiben mit `budget: read` lesende Aktionen', () => {
+  withAccess({ budget: 'read' }, () => {
+    const html = buchungsTab([
+      buchung({ id: 17, category: 'housing', subcategory: 'rent_mortgage' }),
+      buchung({ id: 19, title: 'Nebenkosten', category: 'housing', subcategory: 'utilities' }),
+      buchung({ id: 18, title: 'Lebensmittel', category: 'food', subcategory: 'groceries' }),
+    ], {
+      categoryFilter: 'housing',
+      subcategoryFilter: { category: 'housing', key: 'rent_mortgage' },
+      meta: {
+        expenseCategories: [
+          { key: 'housing', name: 'Wohnen' },
+          { key: 'food', name: 'Lebensmittel' },
+        ],
+        incomeCategories: [],
+        subcategories: { housing: [{ key: 'rent_mortgage', name: 'Miete' }, { key: 'utilities', name: 'Nebenkosten' }] },
+      },
+    });
+    assert.match(html, /data-id="17"/);
+    assert.doesNotMatch(html, /data-id="18"/);
+    assert.match(html, /data-subcategory-filter="rent_mortgage"/);
+  });
+});
+
 test('Leere Buchungsliste mit `budget: read`: nur der Titel, kein CTA und keine Anleitung zum Anlegen', () => {
   withAccess({ budget: 'write' }, () => {
     const html = budget.renderEntries();
@@ -294,9 +318,10 @@ test('Darlehenskarte mit `budget: read`: Bearbeiten, Loeschen und Rate buchen we
     assert.doesNotMatch(html, /loan-edit|loan-delete|loan-pay/);
     assert.doesNotMatch(html, /budget-loan-card__actions/);
     assert.match(html, /data-action="loan-filter"/, 'der Raten-Filter liest nur');
-    // Ein Umschalter, der seinen Zustand ansagt, als geteilte Zeilenaktion mit
-    // dem Darlehen im Namen (Komponenten-Kanon 2026-09-26).
-    assert.match(html, /<button type="button" class="row-action budget-loan-card__filter" data-action="loan-filter" aria-label="budget\.filterLoanNamed\{&quot;name&quot;:&quot;Autokredit&quot;\}" data-id="9" aria-pressed="false">/);
+    // Ein Umschalter, der seinen Zustand ansagt - seit D6 (Critique 2026-10-16)
+    // als Eintrag mit Haken im Mehr-Knopf der Karte, der das Darlehen nennt.
+    assert.match(html, /class="row-action row-action--more budget-loan-card__more popover-menu__trigger"[^>]*aria-label="common\.moreActionsNamed\{&quot;name&quot;:&quot;Autokredit&quot;\}"/);
+    assert.match(html, /role="menuitemcheckbox" aria-checked="false"[\s\S]{0,120}data-action="loan-filter" data-id="9"/);
     assert.match(html, /role="progressbar"/);
     assert.match(html, /Autokredit/);
     assert.match(html, /budget\.loanNextDue/);
@@ -598,7 +623,7 @@ test('Gruppe mit `budget: read`: keine Handlung, aber Salden, Ausgaben und Verla
     assert.doesNotMatch(html, /splitExpenses\.editExpense/);
     assert.match(html, /Urlaub Ostsee/);
     assert.match(html, /Ferienwohnung/);
-    assert.match(html, /splitExpenses\.owes/);
+    assert.match(html, /splitExpenses\.debt(?:Owes|YouOwe|OwesYou)\{/, 'der Saldo steht da (R20: ein Satz je Sicht)');
   });
 });
 
@@ -809,8 +834,8 @@ test('Geteilte Ausgaben: Kopfknopf und Gruppe-Anlegen haengen am Recht', () => {
 // -------------------------------------------------------------------------
 
 test('READ_SAFE_ACTIONS ist eine Positivliste und enthaelt nur lesende Aktionen', () => {
-  assert.deepEqual([...budget.READ_SAFE_ACTIONS], ['loan-filter', 'toggle-planned'],
-    'der Raten-Filter und der Aufklapper von "Geplant" (R17/E4) sind die lesenden `data-action` dieser Seite');
+  assert.deepEqual([...budget.READ_SAFE_ACTIONS], ['loan-filter', 'toggle-planned', 'toggle-loan-payments'],
+    'der Raten-Filter und die Aufklapper von "Geplant" (R17/E4) und der Raten (R20) sind die lesenden `data-action` dieser Seite');
   const alle = new Set([...BUDGET_CODE.matchAll(/data-action="([a-z-]+)"/g)].map((m) => m[1]));
   // Untergrenze nur als Blindheits-Probe: seit R14 P8 stehen Loeschen und
   // Bearbeiten in den Blaettern, die Seite traegt 7 Aktionsnamen.
@@ -1743,3 +1768,97 @@ test('Abo: saving sends the reminder switch for both new and existing subscripti
 });
 
 test.after(() => miniDomAbraeumen());
+
+// R20 (Re-Critique 2026-10-17, A4 P3): eine feste Miete ist am Ersten zu 100 %
+// gebucht und stand den Monat ueber in Bernstein. Genau auf Plan ist keine Warnung.
+test('R20: genau auf Plan ist kein "knapp" - kurz davor schon, darueber rot', () => {
+  assert.equal(plans.toneForRatio(1, false), 'under', 'feste Kosten, genau getroffen');
+  assert.equal(plans.toneForRatio(0.9, false), 'near');
+  assert.equal(plans.toneForRatio(0.5, false), 'under');
+  assert.equal(plans.toneForRatio(1.2, true), 'over');
+});
+
+// -------------------------------------------------------------------------
+// #1997: eine spaete Erfolgsantwort schliesst nur ihren EIGENEN Dialog
+// -------------------------------------------------------------------------
+
+// Kommt die Antwort erst, nachdem der Nutzer den Dialog geschlossen und einen
+// anderen geoeffnet hat, darf das force-Schliessen nur den eigenen treffen. Ob
+// der Slot noch denselben Dialog haelt, entscheidet closeModal({ context }) in
+// components/modal.js (am echten Modul gemessen in test-modal-dead-time.js);
+// hier zaehlt die Verdrahtung: Setzen und Loeschen eines Plans reichen den
+// Kontext von VOR der Anfrage hinein. Gefahren wird je Weg der echte
+// Klick-Handler an einem Attrappen-Panel; die Anfrage wechselt den Kontext.
+test('#1997: Plan setzen und loeschen schliessen nur mit dem Kontext von VOR der Anfrage', async () => {
+  const { view } = plans;
+  const vorher = { data: view.data, ctx: view.ctx, root: view.root, month: view.month, window: globalThis.window };
+  const toasts = [];
+  globalThis.window = { ...(vorher.window ?? {}), yuvomi: { showToast: (text, kind) => toasts.push([text, kind]) } };
+  const knoten = () => ({
+    replaceChildren() {}, insertAdjacentHTML() {}, appendChild() {}, querySelector: () => null, querySelectorAll: () => [],
+    addEventListener() {}, setAttribute() {}, classList: { add() {}, remove() {}, toggle() {} }, dataset: {}, style: {},
+  });
+  const planKontext = () => {
+    view.month = '2026-10';
+    view.data = { plans: [{ category: 'food', planned: 400, actual: 0, ratio: 0, over: false, remaining: 400 }], savings: null };
+    view.ctx = {
+      currency: 'EUR', esc: (s) => String(s), categoryLabel: (c) => `Kat:${c?.key ?? c}`,
+      formatAmount: (v) => `${v} EUR`, expenseCategories: [{ key: 'food' }], budgetMode: 'shared',
+    };
+    const body = knoten();
+    view.root = { ...knoten(), querySelector: (sel) => (sel === '#budget-plan-body' ? body : null) };
+  };
+  /** Oeffnet den Editor ueber den Modal-Stub; liefert den Klick auf `selector`. */
+  const editor = (selector) => {
+    let opts = null;
+    globalThis.__openModal = (o) => { opts = o; };
+    try { withAccess({ budget: 'write' }, () => plans.openPlanEditor({ category: 'food' })); } finally { delete globalThis.__openModal; }
+    assert.ok(opts, 'der Dialog wurde geoeffnet');
+    const handlers = {};
+    const els = {};
+    const el = (sel) => {
+      els[sel] ??= {
+        value: sel === '#plan-amount' ? '450' : '', disabled: false, focus() {}, select() {},
+        addEventListener(type, fn) { handlers[`${sel}:${type}`] = fn; },
+      };
+      return els[sel];
+    };
+    opts.onSave({ querySelector: el, querySelectorAll: () => [], addEventListener() {} });
+    return () => withAccess({ budget: 'write' }, () => handlers[`${selector}:click`]({ currentTarget: el(selector) }));
+  };
+  const WEGE = [['Plan setzen', '#plan-save'], ['Plan loeschen', '#plan-delete']];
+  try {
+    for (const [name, selector] of WEGE) {
+      planKontext();
+      const klick = editor(selector);
+      toasts.length = 0;
+      let kontext = 'eigener-dialog';
+      const geschlossen = [];
+      const geschrieben = [];
+      globalThis.__modalContextId = () => kontext;
+      globalThis.__closeModal = (opts) => { geschlossen.push(opts); };
+      const schreibe = (verb) => async (path) => { geschrieben.push(`${verb} ${path}`); kontext = 'ein-anderer-dialog'; return { data: {} }; };
+      globalThis.__apiStub = {
+        get: async () => ({ data: { plans: [], savings: null } }), put: schreibe('PUT'), delete: schreibe('DELETE'),
+      };
+      try {
+        await klick();
+        // Das Loeschen haengt am Klick ohne zurueckgegebenes Versprechen.
+        for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(geschrieben.length, 1, `${name}: der Weg schreibt`);
+        assert.equal(toasts.some(([, art]) => art === 'danger'), false, `${name}: der Erfolg ist kein Fehler (${JSON.stringify(toasts)})`);
+        assert.equal(geschlossen.length, 1, `${name}: genau ein Schliessen (${JSON.stringify(geschlossen)})`);
+        assert.equal(geschlossen[0].force, true, `${name}: force wie bisher`);
+        assert.equal(geschlossen[0].context, 'eigener-dialog',
+          `${name}: geschlossen wird ohne den Kontext von vor der Anfrage - die spaete Antwort traefe den Dialog, der jetzt offen ist`);
+      } finally {
+        delete globalThis.__modalContextId;
+        delete globalThis.__closeModal;
+        delete globalThis.__apiStub;
+      }
+    }
+  } finally {
+    Object.assign(view, { data: vorher.data, ctx: vorher.ctx, root: vorher.root, month: vorher.month });
+    globalThis.window = vorher.window;
+  }
+});

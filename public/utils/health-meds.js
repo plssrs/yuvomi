@@ -50,7 +50,48 @@ export function indicesToDaysMask(indices) {
 }
 
 /**
+ * DIE Regel "dieses Medikament zaehlt heute" (#1950).
+ *
+ * Ein abgeschaltetes Medikament (`medications.active = 0`) bleibt in der Liste
+ * und behaelt sein Protokoll, erzeugt aber keine faellige Dosis mehr. Die
+ * Gesundheitsseite sammelte die Plaene JEDES geladenen Medikaments ein und
+ * nannte deshalb eine offene Dosis, zu der die Startseite
+ * (`server/routes/dashboard.js`, `WHERE active = 1`) und der Erinnerungslauf
+ * (`server/services/medication-scheduler.js`, `m.active = 1`) schwiegen.
+ *
+ * Sie steht EINMAL hier und nicht an jedem Leser: wer wissen will, ob ein
+ * Medikament Dosen erzeugt, fragt diese Funktion oder nimmt `currentSchedules()`.
+ * Eine weitere Bedingung (etwa ein Enddatum) gehoert in diese Funktion.
+ *
+ * `active` am PLAN ist eine andere Frage und bleibt bei `computeDueDoses()`.
+ *
+ * @param {Object|null|undefined} med - Medikamenten-Zeile mit `active`.
+ * @returns {boolean}
+ */
+export function medicationCountsToday(med) {
+  return Boolean(med && med.active);
+}
+
+/**
+ * Die Einnahmeplaene der Medikamente, die heute zaehlen - der eine Eingang fuer
+ * jeden Leser der Faelligkeit (Heute faellig, naechste Erinnerungen,
+ * Einnahmetreue, Serie).
+ *
+ * @param {Array<Object>} meds - Medikamenten-Zeilen, wie die Seite sie laedt.
+ * @param {Object<string, Array<Object>>} schedulesByMed - Plaene je Medikamenten-Id.
+ * @returns {Array<Object>}
+ */
+export function currentSchedules(meds, schedulesByMed) {
+  return (Array.isArray(meds) ? meds : [])
+    .filter(medicationCountsToday)
+    .flatMap((m) => (schedulesByMed && schedulesByMed[m.id]) || []);
+}
+
+/**
  * Berechnet die fälligen Dosen aus aktiven Einnahmeplänen für einen Zeitraum.
+ *
+ * Welche MEDIKAMENTE dabei sind, entscheidet der Aufrufer ueber
+ * `currentSchedules()` - diese Funktion sieht nur Plaene.
  *
  * @param {Array<Object>} schedules - Einnahmeplan-Zeilen. Erwartete Felder:
  *        id, medication_id, time_of_day ('HH:MM'), days_mask (int|null),
@@ -280,4 +321,107 @@ export function refillState(med) {
     return { level: 'low', stock: rawStock, threshold, below: true };
   }
   return { level: 'ok', stock: rawStock, threshold, below: false };
+}
+
+// --------------------------------------------------------
+// Wiederholbare Dosis-Buchung (#2069)
+// --------------------------------------------------------
+
+/**
+ * Zufaelliger Idempotency-Key, 128 Bit hex.
+ *
+ * `crypto.getRandomValues` statt `crypto.randomUUID`: randomUUID gibt es nur
+ * im sicheren Kontext, und Yuvomi laeuft im Heimnetz oft ueber plain HTTP.
+ */
+export function randomIdempotencyKey() {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Weiss der Aufrufer nach diesem Fehler nicht, ob der Server gebucht hat?
+ * Netzfehler (Status 0), Zeitueberschreitung, Bremse und Serverfehler: die
+ * Anfrage kann angekommen sein, nur die Antwort fehlt. Jede andere Absage ist
+ * eindeutig - gebucht wurde nichts, und ein neuer Versuch ist ein neuer Vorgang.
+ * @param {{ status?: number }} err
+ */
+export function doseOutcomeUnknown(err) {
+  const status = err?.status;
+  // 409 "noch in Arbeit": die erste Anfrage mit diesem Schluessel laeuft noch,
+  // gebucht ist vielleicht schon. Jede andere 409 ist eindeutig.
+  if (status === 409) return err?.data?.reason === 'idempotency_in_progress';
+  return status === 0 || status === 408 || status === 429 || (typeof status === 'number' && status >= 500);
+}
+
+/** So lange gilt ein Tipp nach offenem Ausgang als Wiederholung derselben Dosis. */
+export const DOSE_RETRY_WINDOW_MS = 2 * 60 * 1000;
+
+/**
+ * Gedaechtnis fuer Dosis-Buchungen, deren Ausgang offen ist.
+ *
+ * Geht die Antwort auf `POST .../logs` verloren, ist die Dosis vielleicht
+ * gebucht und der Bestand vielleicht abgezogen. Der naechste Tipp auf dieselbe
+ * Dosis schickt deshalb DENSELBEN Schluessel und DENSELBEN Rumpf (die
+ * Idempotenz-Middleware vergleicht den Rumpf; ein neues `taken_at` waere ein
+ * Konflikt): kam der erste Versuch an, antwortet der Server mit dessen Antwort,
+ * statt ein zweites Mal zu buchen. Nach Erfolg oder eindeutiger Absage ist der
+ * Vorgang vorbei, und der naechste Tipp ist eine neue Dosis.
+ *
+ * NUR FUER DEN UNMITTELBAREN WIEDERHOLVERSUCH. Eine Bedarfsdosis hat kein
+ * Vorkommen, das sie von der naechsten unterscheidet - ihr Schluessel ist nur
+ * das Medikament. Bliebe ein offener Versuch liegen, schickte eine SPAETERE,
+ * gewollte zweite Dosis den alten Schluessel, der Server spielte die alte
+ * Antwort zurueck (24 h lang), und die neue Dosis fehlte still. Deshalb endet
+ * ein offener Versuch auf zwei Wegen:
+ *   - nach DOSE_RETRY_WINDOW_MS: wer spaeter tippt, meint eine neue Dosis;
+ *   - mit dem ersten Laden der Dosis-Daten, das NACH dem Fehlschlag begann
+ *     (`confirmedBy`): ab dann zeigt die Seite den echten Stand - gebucht oder
+ *     nicht -, und ein weiterer Tipp ist eine bewusste neue Aktion. Ein Laden,
+ *     das schon vorher lief, kann den Stand vor der Buchung zeigen und zaehlt
+ *     nicht.
+ * Ein Versuch, dessen Anfrage noch laeuft, bleibt in beiden Faellen stehen.
+ *
+ * @param {{ newKey?: () => string, now?: () => number, retryWindowMs?: number }} [options]
+ */
+export function createDoseAttempts({
+  newKey = randomIdempotencyKey, now = () => Date.now(), retryWindowMs = DOSE_RETRY_WINDOW_MS,
+} = {}) {
+  const pending = new Map();
+  const expired = (entry) => entry.failedAt !== null && now() - entry.failedAt > retryWindowMs;
+  return {
+    /** Schluessel und Rumpf fuer diese Aktion - beim Wiederholversuch die alten. */
+    attempt(actionKey, buildBody, medId = null) {
+      let entry = pending.get(actionKey);
+      if (!entry || expired(entry)) {
+        entry = { key: newKey(), body: buildBody(), failedAt: null, medId };
+        pending.set(actionKey, entry);
+      }
+      entry.failedAt = null; // laeuft wieder
+      return entry;
+    },
+    /** Nach der Antwort: vergessen, ausser der Ausgang ist offen. */
+    settle(actionKey, err = null) {
+      const entry = pending.get(actionKey);
+      if (!entry) return;
+      if (!err || !doseOutcomeUnknown(err)) pending.delete(actionKey);
+      else entry.failedAt = now();
+    },
+    /**
+     * Ein Laden der Dosis-Daten ist durch, das zum Zeitpunkt `startedAt` begann
+     * und die Medikamente `medIds` zeigt: jeder offene Versuch fuer eines davon,
+     * der davor scheiterte, ist damit geklaert. Die Ansicht einer anderen Person
+     * klaert nichts an diesen Medikamenten.
+     */
+    confirmedBy(startedAt, medIds) {
+      const shown = new Set(medIds);
+      for (const [actionKey, entry] of pending) {
+        if (entry.failedAt !== null && entry.failedAt <= startedAt && shown.has(entry.medId)) pending.delete(actionKey);
+      }
+    },
+    has: (actionKey) => {
+      const entry = pending.get(actionKey);
+      return Boolean(entry) && !expired(entry);
+    },
+  };
 }

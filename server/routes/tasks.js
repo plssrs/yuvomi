@@ -36,6 +36,7 @@ import {
   removeTagEverywhere, renameTag, setTags, tagKey, tagsKey, taskIdsWithTag,
 } from '../utils/task-tags.js';
 import * as v from '../middleware/validate.js';
+import { personAvatarUrlSql } from '../services/person-avatar.js';
 
 const log = createLogger('Tasks');
 
@@ -196,7 +197,7 @@ function countRebasableTasks(points) {
 const ASSIGNED_USERS_SQL = `(
   SELECT json_group_array(json_object(
     'id', u.id, 'display_name', u.display_name, 'color', u.avatar_color,
-    'avatar_data', u.avatar_data
+    'avatar_data', ${personAvatarUrlSql('u')}
   ))
   FROM task_assignments ta JOIN users u ON u.id = ta.user_id
   WHERE ta.task_id = t.id
@@ -381,7 +382,7 @@ function loadSubtasks(taskId, me) {
   // Mit den Tags käme deren Freitext dazu.
   const rows = db.get().prepare(`
     SELECT t.*, u.display_name AS assigned_name, u.avatar_color AS assigned_color,
-      u.avatar_data AS assigned_avatar, ${ASSIGNED_USERS_SQL}
+      ${personAvatarUrlSql('u')} AS assigned_avatar, ${ASSIGNED_USERS_SQL}
     FROM tasks t
     LEFT JOIN users u ON t.assigned_to = u.id
     WHERE t.parent_task_id = ?
@@ -761,6 +762,116 @@ router.patch('/categories/reorder', (req, res) => {
   }
 });
 
+/**
+ * Gemeinsame Pruefung der beiden Reorder-Routen: eine nicht-leere, hoechstens
+ * MAX_BULK_TASKS lange Liste verschiedener Ganzzahlen, die alle auf oberste
+ * Aufgaben zeigen, die die Person sehen darf. Antwortet selbst und liefert dann
+ * `null`; sonst die IDs.
+ *
+ * `typeof` vor der Ganzzahlpruefung: `Number(true)` ist 1 und `Number("12")` 12,
+ * beides haette stumm die Aufgabe 1 bzw. 12 umgestellt. Eine fremde, unsichtbare
+ * oder Unteraufgaben-ID antwortet wie eine unbekannte (404) - sonst wuerde eine
+ * Aufgabe umnummeriert, die in keiner Liste dieser Person steht.
+ */
+function parseReorderIds(req, res, list) {
+  if (!Array.isArray(list) || list.length === 0) {
+    res.status(400).json({ error: 'A non-empty array of task IDs is required.', code: 400 });
+    return null;
+  }
+  if (list.length > MAX_BULK_TASKS) {
+    res.status(400).json({ error: `At most ${MAX_BULK_TASKS} tasks at a time.`, code: 400 });
+    return null;
+  }
+  if (list.some((id) => typeof id !== 'number' || !Number.isInteger(id))) {
+    res.status(400).json({ error: 'Only task IDs (integers) are allowed.', code: 400 });
+    return null;
+  }
+  if (new Set(list).size !== list.length) {
+    res.status(400).json({ error: 'A task ID must not appear twice.', code: 400 });
+    return null;
+  }
+  const me = req.authUserId || req.session.userId;
+  const visible = new Set(visibleTaskIds(list, me));
+  const topLevel = new Set(db.get().prepare(
+    `SELECT id FROM tasks WHERE parent_task_id IS NULL AND id IN (${list.map(() => '?').join(',')})`
+  ).all(...list).map((r) => r.id));
+  if (list.some((id) => !visible.has(id) || !topLevel.has(id))) {
+    res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
+    return null;
+  }
+  return list;
+}
+
+// PATCH /api/v1/tasks/reorder  Body: { order: number[] }
+// Handordnung INNERHALB einer Kategorie: die IDs in der gewuenschten Reihenfolge.
+// Muss wie /categories/reorder vor den /:id-Routen stehen.
+//
+// DIE RAENGE WERDEN UMVERTEILT, NICHT NEU VERGEBEN. Die Anfrage nennt nur die
+// Aufgaben, die der Client in dieser Gruppe sieht - bei aktivem Filter oder mit
+// privaten Aufgaben also eine Teilmenge, und zwei Mitglieder senden nie
+// dieselbe. Ein Rang 1..n kollidierte damit von Natur aus mit dem Rang einer
+// Aufgabe, die der Aufrufer nicht sieht (A=3 neben C=3, und die Faelligkeit
+// entschiede wieder). Stattdessen werden die Raenge, die die genannten Aufgaben
+// schon tragen, aufsteigend sortiert und in der neuen Reihenfolge ausgeteilt.
+// Aufgaben ohne Rang bekommen neue Raenge hinter dem groessten vergebenen
+// (MAX + 1, ...). Was der Aufrufer nicht nennt, behaelt seinen Rang und bleibt
+// damit zwischen den anderen stehen; es kollidiert nichts.
+//
+// Nur oberste Aufgaben, die die Person sehen darf (parseReorderIds). Das
+// Umsortieren aendert keinen Inhalt, darum greift die Sperre einzelner Aufgaben
+// (locked) hier nicht: die Reihenfolge gehoert dem Haushalt wie die der
+// Kategorien, nicht dem Ersteller.
+router.patch('/reorder', (req, res) => {
+  try {
+    const ids = parseReorderIds(req, res, req.body?.order);
+    if (!ids) return;
+
+    const placeholders = ids.map(() => '?').join(',');
+    let ranks;
+    db.get().transaction(() => {
+      // Jeder gehaltene Rang wird nur EINMAL ausgeteilt. Dieselbe Zahl kann im
+      // Pool zweimal stehen: die Folgeinstanz einer Wiederholung erbt den Rang
+      // ihrer erledigten Vorgaengerin, und mit angezeigten erledigten Aufgaben
+      // sind beide in der Anfrage. Zweimal ausgeteilt gaeben sie zwei Aufgaben
+      // dieselbe Nummer. Die fehlenden Raenge kommen ueber denselben Weg wie bei
+      // Aufgaben ohne Rang: hinter dem groessten in Gebrauch.
+      const current = [...new Set(db.get()
+        .prepare(`SELECT sort_order FROM tasks WHERE id IN (${placeholders}) AND sort_order IS NOT NULL`)
+        .all(...ids).map((r) => r.sort_order))].sort((a, b) => a - b);
+      const max = db.get().prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM tasks').get().m;
+      // Neue Raenge liegen alle ueber dem groessten bestehenden, die Liste
+      // bleibt also aufsteigend.
+      ranks = current;
+      for (let i = 0; ranks.length < ids.length; i++) ranks.push(max + 1 + i);
+      const update = db.get().prepare('UPDATE tasks SET sort_order = ? WHERE id = ?');
+      ids.forEach((id, idx) => update.run(ranks[idx], id));
+    })();
+    res.json({ data: ids.map((id, idx) => ({ id, sort_order: ranks[idx] })) });
+  } catch (err) {
+    log.error('PATCH /reorder error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
+// POST /api/v1/tasks/reorder/reset  Body: { ids: number[] }
+// Der Weg zurueck zur automatischen Reihenfolge: loescht die Raenge der
+// genannten Aufgaben (sort_order = NULL), die Kategorie sortiert sich dann
+// wieder nach Faelligkeit und Prioritaet. Ohne diesen Weg machte ein einziger
+// versehentlicher Zug die Handordnung dauerhaft. Gleiche Regeln wie PATCH
+// /reorder: nur sichtbare oberste Aufgaben, gesperrte eingeschlossen.
+router.post('/reorder/reset', (req, res) => {
+  try {
+    const ids = parseReorderIds(req, res, req.body?.ids);
+    if (!ids) return;
+    const clear = db.get().prepare('UPDATE tasks SET sort_order = NULL WHERE id = ?');
+    db.get().transaction(() => ids.forEach((id) => clear.run(id)))();
+    res.json({ data: ids.map((id) => ({ id, sort_order: null })) });
+  } catch (err) {
+    log.error('POST /reorder/reset error:', err);
+    res.status(500).json({ error: 'Internal server error.', code: 500 });
+  }
+});
+
 // PUT /api/v1/tasks/categories/:key  Body: { name } → benennt um (Key bleibt stabil,
 // label_key wird gelöscht → der Custom-Name gilt fortan).
 router.put('/categories/:key', (req, res) => {
@@ -821,7 +932,7 @@ router.get('/', (req, res) => {
         t.*,
         u.display_name AS assigned_name,
         u.avatar_color AS assigned_color,
-        u.avatar_data AS assigned_avatar,
+        ${personAvatarUrlSql('u')} AS assigned_avatar,
         ${ASSIGNED_USERS_SQL},
         -- Unteraufgaben tragen eine EIGENE Sichtbarkeit, und diese Liste hing nie
         -- an ihr: unter einer geteilten Elternaufgabe lief eine private
@@ -961,14 +1072,14 @@ router.get('/:id', (req, res) => {
     const me = req.authUserId || req.session.userId;
     const task = db.get().prepare(`
       SELECT t.*, u.display_name AS assigned_name, u.avatar_color AS assigned_color,
-        u.avatar_data AS assigned_avatar, ${ASSIGNED_USERS_SQL}
+        ${personAvatarUrlSql('u')} AS assigned_avatar, ${ASSIGNED_USERS_SQL}
       FROM tasks t
       LEFT JOIN users u ON t.assigned_to = u.id
       WHERE t.id = ? AND t.parent_task_id IS NULL
         AND ${visibilityWhere('t', 'task_assignments', 'task_id')}
     `).get(req.params.id, me, me);
 
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
 
     addAssignedUsers(task);
     task.subtasks = loadSubtasks(task.id, me);
@@ -1083,8 +1194,10 @@ router.post('/', (req, res) => {
         .get(parent_task_id);
       // Unsichtbar heisst hier dasselbe wie nicht vorhanden: sonst verriete 201
       // gegen 404 die Kennung, und der Punkt stuende in einer fremden Checkliste.
+      // Der Grund (#1909): die Aufgabe, an die der Teilschritt sollte, wurde
+      // inzwischen geloescht oder privat gestellt - die Leseansicht sagt das.
       if (!parent || !mayAccessTask(parent, req.authUserId || req.session.userId))
-        return res.status(404).json({ error: 'Parent task not found.', code: 404 });
+        return res.status(404).json({ error: 'Parent task not found.', code: 404, reason: 'tasks_parent_not_found' });
       if (parent.parent_task_id)
         return res.status(400).json({ error: 'Maximal 2 Verschachtelungsebenen erlaubt.', code: 400 });
       // Einen Punkt an eine gesperrte Checkliste zu haengen aendert, was die
@@ -1139,7 +1252,7 @@ router.post('/', (req, res) => {
 
     const task = db.get().prepare(`
       SELECT t.*, u.display_name AS assigned_name, u.avatar_color AS assigned_color,
-        u.avatar_data AS assigned_avatar, ${ASSIGNED_USERS_SQL}
+        ${personAvatarUrlSql('u')} AS assigned_avatar, ${ASSIGNED_USERS_SQL}
       FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id
       WHERE t.id = ?
     `).get(taskId);
@@ -1168,10 +1281,10 @@ router.post('/', (req, res) => {
 router.put('/:id', (req, res) => {
   try {
     const task = db.get().prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     // 404 statt 403: ob es die Aufgabe gibt, ist selbst schon eine Auskunft.
     if (!mayAccessTask(task, req.authUserId || req.session.userId)) {
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     }
 
     const errors = validateTaskInput(req.body, false, task.recurrence_rule);
@@ -1300,12 +1413,20 @@ router.put('/:id', (req, res) => {
           title = ?, description = ?, category = ?, priority = ?,
           status = ?, start_date = ?, due_date = ?, due_time = ?, assigned_to = ?,
           is_recurring = ?, recurrence_rule = ?, recurrence_from_completion = ?,
-          points = ?, visibility = ?, countdown = ?, locked = ?
+          points = ?, visibility = ?, countdown = ?, locked = ?,
+          sort_order = CASE WHEN category = ? THEN sort_order ELSE NULL END
         WHERE id = ?
       `).run(title.trim(), description, category, priority,
              status, start_date, due_date, due_time, firstUid,
              is_recurring ? 1 : 0, recurrence_rule, recurrence_from_completion ? 1 : 0,
-             points, visibility, countdown ? 1 : 0, locked, req.params.id);
+             points, visibility, countdown ? 1 : 0, locked,
+             // Der Rang gilt in der alten Nachbarschaft, nicht in der neuen: die
+             // Aufgabe landete sonst an einem beliebigen Platz einer Liste, die
+             // jemand anderes geordnet hat, meist gleichauf mit der, die diese
+             // Zahl schon traegt. Auf NULL zurueck steht sie dort, wo jede neue
+             // Aufgabe steht (wie im Einkauf, shopping.js).
+             category,
+             req.params.id);
       setAssignments(db.get(), task.id, userIds);
       if (req.body.tags !== undefined) setTags(db.get(), task.id, req.body.tags);
       if (syncTarget !== undefined) {
@@ -1336,7 +1457,7 @@ router.put('/:id', (req, res) => {
       // nicht über Lesearbeit gehalten wird.
       updated = db.get().prepare(`
         SELECT t.*, u.display_name AS assigned_name, u.avatar_color AS assigned_color,
-          u.avatar_data AS assigned_avatar, ${ASSIGNED_USERS_SQL}
+          ${personAvatarUrlSql('u')} AS assigned_avatar, ${ASSIGNED_USERS_SQL}
         FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id
         WHERE t.id = ?
       `).get(req.params.id);
@@ -1627,8 +1748,8 @@ function spawnRecurrenceFollowup(task) {
       INSERT INTO tasks (title, description, category, priority, status,
         start_date, due_date, due_time, assigned_to, created_by, is_recurring, recurrence_rule,
         points, visibility, recurrence_from_completion, countdown, locked, recurrence_origin_id,
-        target_caldav_account_id, target_caldav_list_url, recurrence_series_id)
-      VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        target_caldav_account_id, target_caldav_list_url, recurrence_series_id, sort_order)
+      VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       task.title, task.description, task.category, task.priority,
       shiftedStartDate(task.start_date, task.due_date, nextDate),
@@ -1658,7 +1779,12 @@ function spawnRecurrenceFollowup(task) {
       // erledigte Vorkommen geloescht, weiss die Folgeinstanz nicht mehr, woher
       // sie kommt - und der Punkte-Deckel je Serie saehe in ihr eine neue
       // Aufgabe. Die Kennung ist die ID des ersten Vorkommens und ueberlebt es.
-      seriesOfTask(db.get(), task)
+      seriesOfTask(db.get(), task),
+      // Die Folgeinstanz nimmt den Platz ihrer Vorgaengerin ein (Review an
+      // #1646): sonst fiele eine Aufgabe, die jemand an eine Stelle der Liste
+      // gesetzt hat, bei jedem Abhaken ans Ende. Gerade die wiederkehrenden
+      // Aufgaben sind die, die man ordnet.
+      task.sort_order ?? null
     );
     setAssignments(db.get(), newTask.lastInsertRowid, existingAssignments);
     setTags(db.get(), newTask.lastInsertRowid, existingTags);
@@ -1736,7 +1862,7 @@ router.patch('/:id/status', (req, res) => {
     // externen Kennungen, um den Statuswechsel dem CalDAV-Objekt zuzuordnen.
     const prev = db.get().prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
     if (!prev)
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     // 404 statt 403: ob es die Aufgabe gibt, ist selbst schon eine Auskunft.
     // Dieser Weg hat die Sichtbarkeit fuer Mitglieder nie gefragt - nur der
     // Display-Zweig darunter tat es. Eine geratene id genuegte, um eine fremde
@@ -1745,7 +1871,7 @@ router.patch('/:id/status', (req, res) => {
     // VOR dem Display-Block und vor der Ablage-Abkuerzung, weil beide selbst
     // antworten; dieselbe Regel wie PUT, /archive, /check und DELETE.
     if (!mayAccessTask(prev, req.authUserId || req.session.userId)) {
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     }
 
     // EIN WANDTABLETT HAKT AB, UND ZWAR NUR DAS (#1209).
@@ -1788,7 +1914,7 @@ router.patch('/:id/status', (req, res) => {
     let displayDoneBy = null;
     if (isDisplayRequest(req)) {
       if (prev.visibility !== 'all') {
-        return res.status(404).json({ error: 'Task not found.', code: 404 });
+        return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
       }
       if (status !== 'done') {
         return res.status(403).json({
@@ -1912,12 +2038,12 @@ router.patch('/:id/archive', (req, res) => {
     // Ganze Zeile statt id+status: die Sichtbarkeit und die Sperre stehen in
     // Feldern, die die schmale Auswahl nicht mitbrachte.
     const task = db.get().prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     // 404 statt 403: ob es die Aufgabe gibt, ist selbst schon eine Auskunft.
     // Dieser Weg hat das nie geprueft - eine geratene id genuegte, um eine
     // fremde private Aufgabe abzulegen (Muster aus #769).
     if (!mayAccessTask(task, req.authUserId || req.session.userId)) {
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     }
     // Ablegen nimmt die Aufgabe allen aus der Ansicht (#830).
     if (!mayEditTaskDefinition(task, req)) return res.status(403).json(LOCKED_ERROR);
@@ -1967,10 +2093,10 @@ router.patch('/:id/check', (req, res) => {
   try {
     const id   = parseInt(req.params.id, 10);
     const task = db.get().prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     // 404 statt 403: ob es die Aufgabe gibt, ist selbst schon eine Auskunft.
     if (!mayAccessTask(task, req.authUserId || req.session.userId)) {
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     }
 
     const { line, checked, expect } = req.body;
@@ -2025,10 +2151,10 @@ router.delete('/:id', (req, res) => {
     // Aufgabe kann lokal welche bekommen haben, und die stammen dann selbst aus
     // keiner Liste, aber der Fall kostet nichts.
     const victim = db.get().prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
-    if (!victim) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!victim) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     // 404 statt 403: ob es die Aufgabe gibt, ist selbst schon eine Auskunft.
     if (!mayAccessTask(victim, req.authUserId || req.session.userId)) {
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     }
     // Loeschen ist der endgueltigste Eingriff in die Definition (#830).
     if (!mayEditTaskDefinition(victim, req)) return res.status(403).json(LOCKED_ERROR);
@@ -2040,7 +2166,7 @@ router.delete('/:id', (req, res) => {
 
     const result = db.get().prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id);
     if (result.changes === 0)
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     res.json({ ok: true });
 
     if (queued) pushToCalDAV('Löschung');
@@ -2103,7 +2229,7 @@ router.get('/:id/completions', (req, res) => {
     const me = req.authUserId || req.session.userId;
     const task = db.get().prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
     if (!task || !mayAccessTask(task, me)) {
-      return res.status(404).json({ error: 'Task not found.', code: 404 });
+      return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     }
     res.json({ data: seriesHistory(db.get(), { me, taskId: Number(req.params.id), limit: req.query.limit }) });
   } catch (err) {
@@ -2117,7 +2243,7 @@ router.get('/:id/documents', (req, res) => {
   try {
     const me = req.authUserId || req.session.userId;
     const task = findVisibleTask(req.params.id, me);
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     // Die Route liefert nur Dokumente: ohne Leserecht dort dieselbe Antwort,
     // die der Pfad-Guard vor /documents gaebe (#1358). Erst nach der Aufgabe
     // gefragt, damit eine unsichtbare Aufgabe weiter 404 bleibt.
@@ -2140,7 +2266,7 @@ router.put('/:id/documents', (req, res) => {
   try {
     const me = req.authUserId || req.session.userId;
     const task = findVisibleTask(req.params.id, me);
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     // Angehaengte Dokumente sind Teil der Anweisung - die Anleitung, das
     // Formular, der Zettel, auf den die Aufgabe verweist (#830).
     if (!mayEditTaskDefinition(task, req)) return res.status(403).json(LOCKED_ERROR);
@@ -2252,20 +2378,28 @@ function notifyMentions(task, comment, authorId, previousComment = '') {
 }
 
 /** Ein Kommentar samt Aufgabe, wenn die Person ihn ändern bzw. entfernen darf. */
+// Die Absagen beim Aendern und Loeschen eines Kommentars. Beide 404 tragen
+// denselben Text wie bisher, der Grund unterscheidet (#1909): die Aufgabe ist
+// weg (geloescht oder privat gestellt), oder nur der Kommentar (sein Autor oder
+// ein Admin hat ihn inzwischen geloescht).
+const COMMENT_TASK_GONE = { error: 'Comment not found.', code: 404, reason: 'tasks_task_not_found' };
+const COMMENT_GONE = { error: 'Comment not found.', code: 404, reason: 'tasks_comment_not_found' };
+const COMMENT_NOT_YOURS = { error: 'Not authorized.', code: 403 };
+
 function commentForWrite(req, { allowAdmin = false } = {}) {
   const me = req.authUserId || req.session.userId;
   const found = findVisibleTask(req.params.id, me);
-  if (!found) return { error: 404 };
+  if (!found) return { refusal: COMMENT_TASK_GONE };
   // Mit Titel, weil eine Erwaehnung beim Nachbessern dieselbe Meldung schickt
   // wie beim Schreiben - und die nennt die Aufgabe.
   const task = db.get().prepare('SELECT id, title FROM tasks WHERE id = ?').get(found.id);
 
   const row = db.get().prepare('SELECT * FROM task_comments WHERE id = ? AND task_id = ?')
     .get(req.params.commentId, task.id);
-  if (!row) return { error: 404 };
+  if (!row) return { refusal: COMMENT_GONE };
 
   const mayWrite = row.user_id === me || (allowAdmin && isAdminRequest(req));
-  if (!mayWrite) return { error: 403 };
+  if (!mayWrite) return { refusal: COMMENT_NOT_YOURS };
   return { task, row, me };
 }
 
@@ -2274,7 +2408,7 @@ router.get('/:id/comments', (req, res) => {
   try {
     const me = req.authUserId || req.session.userId;
     const task = findVisibleTask(req.params.id, me);
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
     res.json({ data: loadTaskComments(task.id) });
   } catch (err) {
     log.error('GET /:id/comments error:', err);
@@ -2290,7 +2424,7 @@ router.post('/:id/comments', (req, res) => {
       SELECT t.id, t.title FROM tasks t
       WHERE t.id = ? AND ${visibilityWhere('t', 'task_assignments', 'task_id')}
     `).get(req.params.id, me, me);
-    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404 });
+    if (!task) return res.status(404).json({ error: 'Task not found.', code: 404, reason: 'tasks_task_not_found' });
 
     // `v.str` trimmt und weist einen Kommentar aus lauter Leerzeichen ab.
     const comment = v.str(req.body.comment, 'comment', { max: v.MAX_TEXT, required: true });
@@ -2318,11 +2452,7 @@ router.post('/:id/comments', (req, res) => {
 router.patch('/:id/comments/:commentId', (req, res) => {
   try {
     const found = commentForWrite(req);
-    if (found.error) {
-      return res.status(found.error).json({
-        error: found.error === 403 ? 'Not authorized.' : 'Comment not found.', code: found.error,
-      });
-    }
+    if (found.refusal) return res.status(found.refusal.code).json(found.refusal);
 
     const comment = v.str(req.body.comment, 'comment', { max: v.MAX_TEXT, required: true });
     if (comment.error) return res.status(400).json({ error: comment.error, code: 400 });
@@ -2353,11 +2483,7 @@ router.patch('/:id/comments/:commentId', (req, res) => {
 router.delete('/:id/comments/:commentId', (req, res) => {
   try {
     const found = commentForWrite(req, { allowAdmin: true });
-    if (found.error) {
-      return res.status(found.error).json({
-        error: found.error === 403 ? 'Not authorized.' : 'Comment not found.', code: found.error,
-      });
-    }
+    if (found.refusal) return res.status(found.refusal.code).json(found.refusal);
     db.get().prepare('DELETE FROM task_comments WHERE id = ?').run(found.row.id);
     res.json({ data: { id: found.row.id } });
   } catch (err) {

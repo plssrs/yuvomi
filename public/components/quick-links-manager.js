@@ -23,7 +23,7 @@ import { esc } from '/utils/html.js';
 import { rowActionHtml } from '/utils/row-action.js';
 import { AVATAR_COLORS } from '/utils/color.js';
 import { prefersInkText } from '/utils/contrast.js';
-import { openModal, closeModal, confirmOverModal, reportFieldError, btnError, refocusAfterRender } from '/components/modal.js';
+import { openModal, closeModal, captureModalContext, confirmOverModal, reportFieldError, btnError, refocusAfterRender } from '/components/modal.js';
 import { normalizeQuickLinkUrl, quickLinkHost } from '/utils/quick-link-url.js';
 import { iconElement } from '/utils/lucide-icons.js';
 import { makeSortable } from '/utils/sortable.js';
@@ -259,9 +259,10 @@ function openQuickLinkForm(link, onDone) {
        * Wege, und der Griff auf die Vorschau soll den nehmen, der nichts
        * kostet: kein Dateibrowser, kein Zuschnitt, kein Bild, das irgendwo
        * gesucht werden muss. Wer ein eigenes Bild will, sagt das ausdrücklich. */
-      const openSymbolPicker = async () => {
+      const openSymbolPicker = async (event) => {
+        const trigger = event.currentTarget;
         const { openIconPicker } = await import('/components/icon-picker.js');
-        const chosen = await openIconPicker(state.iconName);
+        const chosen = await openIconPicker(state.iconName, { owner: trigger });
         if (chosen === undefined) return;
         state.iconName = chosen;
         // Ein gewähltes Symbol setzt das Bild ab: sonst gewänne das Bild in
@@ -374,12 +375,15 @@ function openQuickLinkForm(link, onDone) {
         };
 
         const label = saveBtn.textContent;
+        // Geschlossen wird nur dieser Dialog, nicht einer, der waehrend der
+        // Anfrage aufgegangen ist (#1997).
+        const modalContext = captureModalContext();
         saveBtn.disabled = true;
         saveBtn.textContent = '…';
         try {
           if (isEdit) await api.put(`/quick-links/${link.id}`, body);
           else await api.post('/quick-links', body);
-          closeModal({ force: true });
+          closeModal({ force: true, context: modalContext });
           window.yuvomi?.showToast(isEdit ? t('quickLinks.saved') : t('quickLinks.added'), 'success');
           await onDone();
           refocusAfterRender();
@@ -516,3 +520,6 @@ export async function openQuickLinksManager({ onChange = () => {} } = {}) {
     },
   });
 }
+
+// #1997: das Formular einer Kachel, bis in seinen Speichern-Weg.
+export const __test = { openQuickLinkForm };

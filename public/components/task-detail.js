@@ -34,10 +34,11 @@ import { t, formatDate, formatTime } from '/i18n.js';
 import { openDetailView, closeDetailView, visibilityRow } from '/components/detail-view.js';
 import { closeModal, btnLoading, refocusAfterRender } from '/components/modal.js';
 import { recurrenceRow } from '/rrule-ui.js';
-import { scheduleUndoableDelete, acknowledgeCheck } from '/utils/ux.js';
+import { scheduleUndoableDelete, acknowledgeCheck, isImeComposing } from '/utils/ux.js';
 import { rowActionEl } from '/utils/row-action.js';
 import { renderMarkdownLight } from '/utils/html.js';
 import { splitKeepingLineEndings } from '/utils/markdown-checklist.js';
+import { errorSentence, isAlreadyDeleted } from '/utils/friendly-error.js';
 import { splitMentions, applyMention } from '/utils/mentions.js';
 import { refresh as refreshReminders } from '/reminders.js';
 import { parseRemindAtAsUtc } from '/utils/reminder-offset.js';
@@ -51,6 +52,7 @@ import {
   isArchived, canEditTaskDefinition, catLabel, normalizeTagList,
   docMime, docHref, docIcon, formatDueDate, seriesDoneText,
 } from '/utils/task-fields.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 // --------------------------------------------------------
 // Schreibwege, die die Ansicht selbst geht
@@ -112,14 +114,20 @@ export async function deleteTaskWithUndo(id, { container = null, onChanged = () 
       // `tasks: write` + `calendar: read` in ein verschlucktes 403, und selbst
       // wenn er ankam, loeschte er nur die EIGENEN Zeilen: die Erinnerung, die
       // sich jemand anderes auf dieselbe Aufgabe gesetzt hatte, blieb stehen.
-      await api.delete(`/tasks/${id}`, { keepalive });
+      try {
+        await api.delete(`/tasks/${id}`, { keepalive });
+      } catch (err) {
+        // Schon geloescht (oder privat gestellt) ist, was gewollt war (#1909):
+        // kein Fehler, die Zeile kommt nicht zurueck.
+        if (!isAlreadyDeleted(err, 'tasks_task_not_found')) throw err;
+      }
       if (keepalive) return; // Seite verschwindet — kein UI-Refresh mehr
       refreshReminders();
       await onChanged();
     },
     restore: (err) => {
       for (const el of rows) el.style.display = '';
-      if (err) window.yuvomi.showToast(err.message ?? t('common.unknownError'), 'danger');
+      if (err) window.yuvomi.showToast(errorSentence(err), 'danger');
     },
   });
 }
@@ -144,7 +152,10 @@ export async function addSubtask(parentId, title, { onChanged = () => {} } = {})
     await onChanged();
     return res.data ?? null;
   } catch (err) {
-    window.yuvomi.showToast(err.message, 'danger');
+    // Der Satz der App, nie der des Servers (#1909). Ist die Aufgabe selbst
+    // inzwischen weg, kommt die Umgebung frisch - sie zeigt sie dann nicht mehr.
+    window.yuvomi.showToast(errorSentence(err), 'danger');
+    if (isAlreadyDeleted(err, 'tasks_parent_not_found')) await Promise.resolve(onChanged()).catch(() => {});
     return null;
   }
 }
@@ -173,18 +184,20 @@ export async function addSubtask(parentId, title, { onChanged = () => {} } = {})
 // keine Durchgangsstation. Es steht nur nicht mehr im Weg.
 const STATUS_ACTIONS = {
   open: [
-    // ERLEDIGEN IST DIE HAUPTAKTION (Critique R18, 2026-10-07). Der haeufigste
-    // Grund, eine Aufgabe zu oeffnen, ist sie abzuhaken - und der Knopf dafuer
-    // stand als einer von vier gleich leisen im Fuss. Er ist jetzt der EINE
-    // Primaerknopf des Blatts (Bearbeiten steht hier im Kopf, nicht im Fuss).
+    // ERLEDIGEN IST DIE HAUPTAKTION DER AUFGABE (Critique R18, 2026-10-07;
+    // Ulas 2026-10-16). Der haeufigste Grund, eine Aufgabe zu oeffnen, ist sie
+    // abzuhaken. Deshalb ist die Aufgabe die EINE benannte Ausnahme von
+    // "Bearbeiten ist ueberall primaer" (withPrimaryEdit, `keepPrimary`):
+    // Erledigen bleibt gefuellt, Bearbeiten tritt sekundaer davor.
     { id: 'task-detail-finish', status: 'done',        labelKey: 'tasks.detailFinish', icon: 'check',      variant: 'primary' },
     { id: 'task-detail-start',  status: 'in_progress', labelKey: 'tasks.detailStart',  icon: 'circle-dot', variant: 'ghost' },
   ],
   in_progress: [
     { id: 'task-detail-finish', status: 'done',        labelKey: 'tasks.detailFinish', icon: 'check',      variant: 'primary' },
   ],
+  // Fuer eine erledigte Aufgabe ist der Rueckweg dasselbe: Wieder oeffnen.
   done: [
-    { id: 'task-detail-reopen', status: 'open',        labelKey: 'tasks.detailReopen', icon: 'rotate-ccw', variant: 'secondary' },
+    { id: 'task-detail-reopen', status: 'open',        labelKey: 'tasks.detailReopen', icon: 'rotate-ccw', variant: 'primary' },
   ],
 };
 
@@ -306,8 +319,16 @@ function subtaskListNode(task, ctx) {
         // Elternkarte - die Liste, das Widget, der Kalendertag.
         await ctx.onChanged();
       } catch (err) {
+        window.yuvomi.showToast(errorSentence(err), 'danger');
+        if (isAlreadyDeleted(err, 'tasks_task_not_found')) {
+          // Den Teilschritt gibt es nicht mehr: die Zeile geht, die Umgebung
+          // (Fortschritt der Elternkarte) kommt frisch.
+          row.remove();
+          task.subtasks = (task.subtasks ?? []).filter((sub) => sub.id !== s.id);
+          await Promise.resolve(ctx.onChanged()).catch(() => {});
+          return;
+        }
         paint(row, previous, s.title);
-        window.yuvomi.showToast(err.message, 'danger');
       } finally {
         row.disabled = false;
       }
@@ -484,9 +505,10 @@ function documentListNode(docs) {
       link.rel = 'noopener';
       link.title = doc.name || '';
       const img = document.createElement('img');
-      img.src = `/api/v1/documents/${doc.id}/preview`;
-      img.alt = doc.name || '';
+      // `loading` vor `src`: sonst laedt Safari sofort statt faul (#2048).
       img.loading = 'lazy';
+      img.alt = doc.name || '';
+      img.src = `/api/v1/documents/${doc.id}/preview`;
       link.appendChild(img);
       grid.appendChild(link);
     }
@@ -602,13 +624,18 @@ function commentRowNode(comment, { onChanged, ctx }) {
       scheduleUndoableDelete({
         message: t('tasks.commentDeletedToast'),
         commit: async ({ keepalive }) => {
-          await api.delete(`/tasks/${comment.task_id}/comments/${comment.id}`, { keepalive });
+          try {
+            await api.delete(`/tasks/${comment.task_id}/comments/${comment.id}`, { keepalive });
+          } catch (err) {
+            // Schon geloescht ist, was gewollt war (#1909).
+            if (!isAlreadyDeleted(err, 'tasks_comment_not_found')) throw err;
+          }
           if (keepalive) return; // Seite verschwindet - kein Nachladen mehr
           await onChanged();
         },
         restore: (err) => {
           row.hidden = false;
-          if (err) window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+          if (err) window.yuvomi.showToast(errorSentence(err), 'danger');
         },
       });
     });
@@ -661,7 +688,11 @@ function startCommentEdit(row, comment, { onChanged, ctx }) {
       await onChanged();
     } catch (err) {
       save.disabled = false;
-      window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+      window.yuvomi.showToast(errorSentence(err), 'danger');
+      // Kommentar oder Aufgabe sind inzwischen weg: die Liste kommt frisch.
+      if (isAlreadyDeleted(err, 'tasks_comment_not_found') || isAlreadyDeleted(err, 'tasks_task_not_found')) {
+        await Promise.resolve(onChanged()).catch(() => {});
+      }
     }
   });
 
@@ -763,7 +794,7 @@ function wireMentionSuggest(field, ctx) {
     if (!box || !matches.length) return;
     if (e.key === 'ArrowDown')      { e.preventDefault(); active = (active + 1) % matches.length; render(); }
     else if (e.key === 'ArrowUp')   { e.preventDefault(); active = (active - 1 + matches.length) % matches.length; render(); }
-    else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); apply(matches[active]); }
+    else if ((e.key === 'Enter' && !isImeComposing(e)) || e.key === 'Tab') { e.preventDefault(); apply(matches[active]); }
     else if (e.key === 'Escape')    { e.stopPropagation(); close(); }
   });
 
@@ -844,9 +875,9 @@ function commentsNode(task, ctx) {
     try {
       await api.post(`/tasks/${task.id}/comments`, { comment: value });
       field.value = '';
-      await load();
+      await reloadAfterSave(() => load());
     } catch (err) {
-      window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+      window.yuvomi.showToast(errorSentence(err), 'danger');
     } finally {
       submit.disabled = false;
     }
@@ -1021,7 +1052,7 @@ async function toggleDescriptionCheck(task, box) {
   } catch (err) {
     paint(!checked);
     window.yuvomi?.showToast(
-      err.status === 409 ? t('tasks.checkConflict') : (err.data?.error ?? t('common.unknownError')),
+      err.status === 409 ? t('tasks.checkConflict') : errorSentence(err, 'common.unknownError'),
       'danger',
     );
   }
@@ -1117,6 +1148,18 @@ export function openTaskDetail({
     },
   }] : [];
 
+  // Ablegen und Zurückholen sind derselbe Schalter - was er tut, hängt daran, wo
+  // die Aufgabe gerade liegt.
+  if (canEdit) {
+    actions.push({
+      id: 'task-detail-archive',
+      label: archived ? t('tasks.unarchiveButton') : t('tasks.archiveButton'),
+      variant: 'ghost',
+      icon: archived ? 'archive-restore' : 'archive',
+      onClick: ({ button, close }) => toggleTaskArchive(task, button, ctx, close),
+    });
+  }
+
   // Der häufigste Grund, eine Aufgabe zu öffnen, ist sie abzuhaken. Bisher
   // führte dieser Weg durch ein Formular mit sieben Auswahlfeldern.
   //
@@ -1130,7 +1173,10 @@ export function openTaskDetail({
   let viewClose = closeDetailView;
   const doers = doerChoices(task, ctx, archived);
   if (!isNavModuleReadOnly('tasks')) {
-    statusActions.forEach((step) => {
+    // Der Primaerknopf (Erledigen/Wieder oeffnen) steht zuletzt, direkt vor
+    // seinem Personenknopf: am Ende des Fusses, wo der Daumen liegt, und
+    // Bearbeiten tritt sekundaer davor (withPrimaryEdit, `keepPrimary`).
+    [...statusActions].sort((a, b) => (a.variant === 'primary') - (b.variant === 'primary')).forEach((step) => {
       actions.push({
         id: step.id,
         label: t(step.labelKey),
@@ -1150,22 +1196,12 @@ export function openTaskDetail({
     });
   }
 
-  // Ablegen und Zurückholen sind derselbe Schalter - was er tut, hängt daran, wo
-  // die Aufgabe gerade liegt.
-  if (canEdit) {
-    actions.push({
-      id: 'task-detail-archive',
-      label: archived ? t('tasks.unarchiveButton') : t('tasks.archiveButton'),
-      variant: 'ghost',
-      icon: archived ? 'archive-restore' : 'archive',
-      onClick: ({ button, close }) => toggleTaskArchive(task, button, ctx, close),
-    });
-  }
-
   // MOBIL EINE REIHE (Re-Critique 2026-09-28, P8 / A3 P3-2): Starten und
   // Archivieren treten auf dem Telefon in EIN Mehr-Menue (detail-view.css);
   // am Desktop stehen sie weiter im Fuss, und dort gibt es den Knopf nicht.
-  const overflowIds = ['task-detail-start', 'task-detail-archive'];
+  // Seit R19 auch Loeschen: mit Loeschen, Bearbeiten, Erledigen, Wer und
+  // Mehr brach der Fuss auf dem Telefon wieder auf zwei Reihen.
+  const overflowIds = ['task-detail-start', 'task-detail-archive', 'task-detail-delete'];
   if (actions.some((a) => overflowIds.includes(a.id))) {
     actions.push({ id: MORE_BUTTON_ID, label: '', variant: 'ghost', icon: 'more-horizontal' });
   }
@@ -1183,6 +1219,8 @@ export function openTaskDetail({
     onClose: onClose ?? undefined,
     sections: renderTaskDetail(task, reminder, ctx),
     actions,
+    // Erledigen bzw. Wieder oeffnen bleibt der Primaerknopf (siehe STATUS_ACTIONS).
+    keepPrimary: true,
     edit: canEdit && edit ? {
       label: t('common.edit'),
       title: t('tasks.editTask'),
@@ -1200,7 +1238,7 @@ export function openTaskDetail({
 const MORE_BUTTON_ID = 'task-detail-more';
 
 /**
- * Das Mehr-Menue des Detail-Fusses (mobil). Seine Eintraege LOESEN DIE ECHTEN
+ * Das Mehr-Menue des Detail-Fusses (jede Breite). Seine Eintraege LOESEN DIE ECHTEN
  * KNOEPFE AUS, statt eigene Handler zu tragen: Starten und Archivieren bleiben
  * (verborgen) im Fuss, damit statusActionButtons() sie weiter mitsperrt und
  * btnLoading() seinen Knopf findet - ein Handler, eine Sperrlogik.
@@ -1229,7 +1267,9 @@ function wireDetailMoreMenu(task, overflowIds, pane = null) {
     target.classList.add('task-detail__overflow');
     const item = document.createElement('button');
     item.type = 'button';
-    item.className = 'popover-menu__item';
+    // Loeschen bleibt im Menue als destruktiv erkennbar.
+    item.className = target.classList.contains('btn--danger-ghost')
+      ? 'popover-menu__item popover-menu__item--danger' : 'popover-menu__item';
     item.setAttribute('role', 'menuitem');
     const icon = document.createElement('i');
     icon.dataset.lucide = target.querySelector('[data-lucide]')?.dataset.lucide
@@ -1325,7 +1365,7 @@ async function completeFor(task, person, button, ctx, close) {
   } catch (err) {
     stop();
     siblings.forEach((el) => { el.disabled = false; });
-    window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+    await sayWriteFailed(err, ctx, close);
     return;
   }
   task.status = 'done';
@@ -1388,7 +1428,7 @@ async function advanceTaskStatus(task, status, button, ctx, close = closeDetailV
     siblings.forEach((el) => { el.disabled = false; });
     // Gescheitert ist ein Schreibvorgang, kein Laden - tasks.loadError („Aufgabe
     // konnte nicht geladen werden") beschriebe den falschen Vorgang.
-    window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+    await sayWriteFailed(err, ctx, close);
     return;
   }
   task.status = status;
@@ -1399,6 +1439,17 @@ async function advanceTaskStatus(task, status, button, ctx, close = closeDetailV
   const seriesText = status === 'done' ? seriesDoneText(response) : null;
   if (seriesText) window.yuvomi.showToast(seriesText, 'default', SERIES_TOAST_MS);
   await afterConfirmedWrite(ctx, close);
+}
+
+/**
+ * Ein Schreibvorgang aus der Ansicht ist gescheitert: der Satz der App, nie der
+ * des Servers (#1909). Gibt es die Aufgabe nicht mehr (geloescht oder privat
+ * gestellt), hat die Ansicht nichts mehr zu zeigen - sie geht zu, und die
+ * Umgebung kommt frisch, wie nach einem Erfolg.
+ */
+async function sayWriteFailed(err, ctx, close) {
+  window.yuvomi.showToast(errorSentence(err), 'danger');
+  if (isAlreadyDeleted(err, 'tasks_task_not_found')) await afterConfirmedWrite(ctx, close);
 }
 
 /**
@@ -1444,7 +1495,7 @@ async function toggleTaskArchive(task, button, ctx, close = closeDetailView) {
     await setTaskArchived(task.id, !archived);
   } catch (err) {
     stop();
-    window.yuvomi.showToast(err.message ?? t('common.errorGeneric'), 'danger');
+    await sayWriteFailed(err, ctx, close);
     return;
   }
   task.archived_at = archived ? null : new Date().toISOString();
@@ -1499,7 +1550,8 @@ function seriesHistoryNode(task) {
       // Zeile im Haushaltsverlauf "Lea - abgehakt von Mama" ist und hier bloss
       // "Lea": genau die Auskunft, die diese Aenderung neu aufbewahrt, ginge in
       // der einen der beiden Ansichten wieder verloren (Review Runde 1).
-      who.textContent = entry.person_name || t('tasks.historyUnknownMember');
+      who.textContent = entry.person_name
+        || (entry.source === 'caldav' ? t('tasks.historyViaSync') : t('tasks.historyUnknownMember'));
       row.append(when, who);
       if (entry.done_by_user_id && entry.done_by_user_id !== entry.user_id) {
         const by = document.createElement('span');
@@ -1525,4 +1577,4 @@ function seriesHistoryNode(task) {
  * der sich die Nur-lesen-Regel (#467) an dieser Ansicht MESSEN laesst - alles
  * andere hier haengt an `openDetailView` und damit am echten DOM.
  */
-export const __test = { subtaskListNode, descriptionNode, documentListNode, doerChoices, wireDetailDoerMenu, DOER_BUTTON_ID, completeFor };
+export const __test = { subtaskListNode, descriptionNode, documentListNode, doerChoices, wireDetailDoerMenu, DOER_BUTTON_ID, completeFor, advanceTaskStatus, toggleTaskArchive, toggleDescriptionCheck, commentRowNode, startCommentEdit };

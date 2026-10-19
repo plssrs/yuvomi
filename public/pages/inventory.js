@@ -19,9 +19,11 @@ import {
   reportFieldError,
   confirmModal,
   refocusAfterRender,
+  captureModalContext,
 } from '/components/modal.js';
+import { errorSentence, isGone, isAlreadyDeleted, loadErrorSentence } from '/utils/friendly-error.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
-import { emptyStateEl } from '/utils/empty-state.js';
+import { emptyStateEl, searchEmptyOptions } from '/utils/empty-state.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { pageToolsMenuHtml, pageToolsActionEl, installPopoverMenus } from '/utils/popover-menu.js';
 import { formatMoney } from '/utils/money.js';
@@ -35,8 +37,10 @@ import { mountMasterDetail, splitViewDetailHtml } from '/utils/master-detail.js'
 import { wireScrollFade } from '/utils/ux.js';
 import { redrawList, collapseRow } from '/utils/list-motion.js';
 import { attachOverlay, whenHistorySettled } from '/utils/overlay-history.js';
+import { inertOutside } from '/utils/background-inert.js';
 import { setNavBadge } from '/utils/nav-badges.js';
 import { CHART, chartScales, chartY, chartGridMarkup, niceDomain, chartTimePositions, chartTimeLabelsMarkup } from '/utils/chart.js';
+import { reloadAfterSave } from '/utils/reload-after-save.js';
 
 let _container = null;
 let _search = null;
@@ -122,7 +126,9 @@ async function openLocationManager() {
       // Auffrischung, und ohne Meldung zeigte die Seite den alten Stand
       // weiter, obwohl der Server die Gegenstaende bereits umgehaengt hat.
       console.error('[Inventory] Auffrischen nach Ort-Aenderung fehlgeschlagen:', err);
-      window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+      // Ein Ladefehler: sein Satz (Netz, Bremse, Server), nie der Text des
+      // Servers (#1909).
+      window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     }
   };
 
@@ -142,6 +148,11 @@ async function openLocationManager() {
         addPlaceholderKey: 'inventory.addLocation',
         deleteDetailKey: 'inventory.locationDeleteConfirmDetail',
         subDeleteDetailKey: 'inventory.locationDeleteConfirmDetail',
+        // Die Orte nennen ihre Faelle (#1909): den Namen gibt es schon, den Ort
+        // gibt es nicht mehr. Alles andere sagt den allgemeinen Satz, nie den
+        // des Servers; ein Loeschen, dem jemand zuvorkam, ist ein Erfolg.
+        errorFallbackKey: 'common.errorGeneric',
+        alreadyDeletedReason: 'inventory_location_not_found',
       });
     },
     // Bewusst KEIN onClose, das den Listener abmeldet - es liefe vor dem
@@ -172,7 +183,7 @@ async function openCategoryManager() {
       // Wie beim Ort-Manager: hier landet nur ein Fehler der Auffrischung,
       // nie einer der Mutation - die hat der Manager schon quittiert.
       console.error('[Inventory] Auffrischen nach Kategorie-Aenderung fehlgeschlagen:', err);
-      window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+      window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     }
   };
 
@@ -190,6 +201,10 @@ async function openCategoryManager() {
         hintKey: 'inventory.manageCategoriesHint',
         addPlaceholderKey: 'inventory.addCategory',
         deleteDetailKey: 'inventory.categoryDeleteConfirmDetail',
+        // Wie bei den Orten (#1909): `category_exists` sagt der Verwalter
+        // selbst, die verschwundene Kategorie ihr eigener Satz.
+        errorFallbackKey: 'common.errorGeneric',
+        alreadyDeletedReason: 'inventory_category_not_found',
       });
     },
     // Bewusst KEIN onClose, das den Listener abmeldet - es liefe vor dem
@@ -749,13 +764,12 @@ function renderListBody() {
   if (!groups.length) {
     list.appendChild(emptyStateEl(
       state.query
-        ? {
-            variant: 'no-results',
-            title: t('inventory.noResultsTitle'),
-            description: t('inventory.noResultsDescription'),
-            hint: [`"${state.query}"`, state.filterAttention ? t('inventory.metricAttentionLabel') : null].filter(Boolean).join(' · '),
-            action: { label: t('inventory.resetSearch'), onClick: resetFilters },
-          }
+        // Der EINE Leerzustand einer leeren Suche (R19): Begriff und Filter als Chips.
+        ? searchEmptyOptions({
+          query: state.query,
+          filters: state.filterAttention ? [t('inventory.metricAttentionLabel')] : [],
+          onReset: resetFilters,
+        })
         : {
             variant: 'no-results',
             title: t('inventory.attentionEmptyTitle'),
@@ -775,6 +789,42 @@ function renderListBody() {
 async function loadItems() {
   const res = await api.get('/inventory/items');
   state.items = res.data;
+}
+
+/**
+ * "GIBT ES NICHT MEHR" (#1909): ein anderes Haushaltsmitglied war schneller.
+ * Der Gegenstand selbst ist weg -> er faellt aus dem Stand, ohne die Liste neu
+ * zu holen. Eine Frist fehlt -> der Gegenstand hat sich geaendert, er kommt
+ * frisch. Gezeichnet wird nur, solange die Seite, von der die Anfrage kam,
+ * noch die gezeigte ist (`owner`, vor der Anfrage genommen).
+ */
+async function applyGone(err, itemId, owner) {
+  if (err?.data?.reason === 'inventory_item_not_found') {
+    state.items = state.items.filter((i) => i.id !== itemId);
+  } else if (err?.data?.reason === 'inventory_tracked_date_not_found') {
+    try {
+      await loadItems();
+    } catch {
+      return;
+    }
+  } else {
+    return;
+  }
+  if (!owner || _container !== owner) return;
+  renderList({ repaint: true });
+  updateAttentionBadge();
+}
+
+/** Die Optionen der Ortsauswahl: ohne Ort, dann jeder Ort mit seinen Unterorten. */
+function locationOptionsHtml() {
+  const options = [`<option value="">${esc(t('inventory.unlocated'))}</option>`];
+  for (const root of state.locations) {
+    options.push(`<option value="${root.id}">${esc(root.name)}</option>`);
+    for (const child of root.subcategories ?? []) {
+      options.push(`<option value="${child.id}">${esc(root.name)} · ${esc(child.name)}</option>`);
+    }
+  }
+  return options.join('');
 }
 
 // --------------------------------------------------------
@@ -1268,8 +1318,10 @@ async function openItemDetail(item, { pane = null, signal = null } = {}) {
   openDetailView({
     title: item.name,
     key: `inventory:${item.id}`,
-    accentColor: 'var(--module-inventory)',
     size: 'md',
+    // Schmal Label und Wert in einer Zeile (R19, Critique 2026-10-16): 57px je
+    // Feld fuer "Kaufdatum / 12.03.2024" schoben die Garantie unter den Falz.
+    rowLayout: 'inline',
     pane,
     sections: renderItemDetail(item, history, onDoneTrackedDate, historyLoadFailed),
     // OHNE SCHREIBRECHT WEDER „LOESCHEN" NOCH „BEARBEITEN": `openDetailView`
@@ -1289,10 +1341,9 @@ async function openItemDetail(item, { pane = null, signal = null } = {}) {
     edit: ro ? null : {
       label: t('common.edit'),
       title: t('common.editItem'),
-      // Im Sheet ist Bearbeiten die Hauptaktion und steht unten in der
-      // Daumenzone; Loeschen bleibt zurueckgenommen am Anfang und fragt
+      // Bearbeiten steht als Hauptaktion unten (detail-view.js,
+      // withPrimaryEdit); Loeschen bleibt zurueckgenommen am Anfang und fragt
       // weiter nach (removeItem), wie im Kalender (#1460, #1463).
-      primary: true,
       mount: (panel, editPane) => {
         const form = buildItemForm({ mode: 'edit', item });
         editPane.insertAdjacentHTML('beforeend', form.content);
@@ -1363,6 +1414,8 @@ function openCompletionSheet(item, trackedDate) {
             note: panel.querySelector('#inv-complete-note').value.trim() || null,
           };
           saveBtn.disabled = true;
+          const owner = _container;
+          const dialog = captureModalContext();
           try {
             await api.post(`/inventory/items/${item.id}/dates/${trackedDate.id}/complete`, payload);
             // ERST settle(true), DANN das Modal schliessen: das Schliessen
@@ -1373,11 +1426,22 @@ function openCompletionSheet(item, trackedDate) {
             // und der Abschluss saehe fuer den Aufrufer wie ein Abbruch aus,
             // obwohl die Frist bereits serverseitig erledigt ist.
             settle(true);
-            await closeSharedModal({ force: true });
+            // Nur diese Karte, nicht ein Dialog, der waehrend der Anfrage
+            // aufgegangen ist (#1997).
+            await closeSharedModal({ force: true, context: dialog });
             window.yuvomi?.showToast(t('inventory.completed'), 'success');
           } catch (err) {
             saveBtn.disabled = false;
-            window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+            window.yuvomi?.showToast(errorSentence(err), 'danger');
+            // Gegenstand oder Frist gibt es nicht mehr (#1909): nichts mehr zu
+            // erledigen - die Karte geht zu, solange sie noch die offene ist,
+            // und die Liste zeigt den aktuellen Stand.
+            if (isGone(err)) {
+              settle(false);
+              closeSharedModal({ force: true, context: dialog });
+              await applyGone(err, item.id, owner);
+              refocusAfterRender();
+            }
           }
         });
         if (window.lucide) window.lucide.createIcons({ el: panel });
@@ -1495,6 +1559,9 @@ function openBookingPicker(panel, { initialMonth, includeRole = false } = {}) {
     panel.append(overlay);
     if (window.lucide) window.lucide.createIcons({ el: overlay });
     const opener = document.activeElement;
+    // Das Formular darunter ist gesperrt, solange der Picker offen ist
+    // (utils/background-inert.js); freigegeben VOR der Fokus-Rueckgabe.
+    const releaseBackground = inertOutside(overlay);
     overlay.querySelector('[data-picker-close]').focus();
 
     const listEl = overlay.querySelector('[data-picker-list]');
@@ -1504,6 +1571,7 @@ function openBookingPicker(panel, { initialMonth, includeRole = false } = {}) {
 
     const close = (result) => {
       overlay.remove();
+      releaseBackground();
       if (opener?.isConnected) opener.focus();
       resolve(result);
     };
@@ -1776,13 +1844,9 @@ function buildItemForm({ mode, item = null }) {
   let photoData = isEdit && item.photo_data ? item.photo_data : null;
 
   const categoryOptions = categoryOptionsHtml(state.categories);
-  const locationOptions = [`<option value="">${esc(t('inventory.unlocated'))}</option>`];
-  for (const root of state.locations) {
-    locationOptions.push(`<option value="${root.id}">${esc(root.name)}</option>`);
-    for (const child of root.subcategories || []) {
-      locationOptions.push(`<option value="${child.id}">${esc(root.name)} · ${esc(child.name)}</option>`);
-    }
-  }
+  // Derselbe Helfer baut die Auswahl neu, wenn der gewaehlte Ort beim
+  // Speichern weg ist (#1909).
+  const locationOptions = locationOptionsHtml();
   const conditionOptions = CONDITIONS.map((c) => `<option value="${c}">${esc(t(`inventory.condition${c.charAt(0).toUpperCase()}${c.slice(1)}`))}</option>`).join('');
   const statusOptions = STATUSES.map((s) => `<option value="${s}">${esc(t(`inventory.status${s.charAt(0).toUpperCase()}${s.slice(1)}`))}</option>`).join('');
   const documentCategoryOptions = DOCUMENT_CATEGORIES
@@ -1800,27 +1864,9 @@ function buildItemForm({ mode, item = null }) {
         </div>
         <div class="form-group">
           <label class="form-label" for="inv-location">${esc(t('inventory.locationLabel'))}</label>
-          <select id="inv-location" class="form-input">${locationOptions.join('')}</select>
+          <select id="inv-location" class="form-input">${locationOptions}</select>
         </div>
       </div>
-      <div class="form-pair form-pair--wide">
-        <div class="form-group">
-          <label class="form-label" for="inv-purchase-date">${esc(t('inventory.purchaseDateLabel'))}</label>
-          <yuvomi-datepicker id="inv-purchase-date" type="date"
-                             value="${esc(isEdit && item.purchase_date ? item.purchase_date : '')}"></yuvomi-datepicker>
-        </div>
-        <div class="form-group">
-          <label class="form-label" for="inv-purchase-price">${esc(t('inventory.purchasePriceLabel'))}</label>
-          <input id="inv-purchase-price" class="form-input" type="number" min="0" step="0.01" inputmode="decimal">
-        </div>
-      </div>
-      ${!isEdit && showsBookings ? `
-      <div class="form-group">
-        <button class="btn btn--secondary btn--sm" type="button" data-action="link-booking">
-          <i data-lucide="link" aria-hidden="true"></i> ${esc(t('inventory.linkBooking'))}
-        </button>
-        <div data-picked-booking-chip hidden></div>
-      </div>` : ''}
       <div class="form-group">
         <label class="form-label" for="inv-status">${esc(t('inventory.statusLabel'))}</label>
         <select id="inv-status" class="form-input">${statusOptions}</select>
@@ -1833,7 +1879,30 @@ function buildItemForm({ mode, item = null }) {
           <i data-lucide="plus" aria-hidden="true"></i> ${esc(t('inventory.addBooking'))}
         </button>
       </div>` : ''}
+      ${/* SELTENES HINTER „WEITERE ANGABEN" (Critique 2026-10-16, D4). Der
+           Dialog zeigte bis zu 22 Felder; vorn stehen jetzt Name, Kategorie,
+           Ort und Status (beim Bearbeiten dazu die verknuepften Buchungen).
+           Kauf, Garantie, Foto und Dokumente stehen dahinter, und die zweite
+           Zeile des Aufklappers nennt sie, damit man sie findet. */ ''}
       ${advancedSection(`
+        <div class="form-pair form-pair--wide">
+          <div class="form-group">
+            <label class="form-label" for="inv-purchase-date">${esc(t('inventory.purchaseDateLabel'))}</label>
+            <yuvomi-datepicker id="inv-purchase-date" type="date"
+                               value="${esc(isEdit && item.purchase_date ? item.purchase_date : '')}"></yuvomi-datepicker>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="inv-purchase-price">${esc(t('inventory.purchasePriceLabel'))}</label>
+            <input id="inv-purchase-price" class="form-input" type="number" min="0" step="0.01" inputmode="decimal">
+          </div>
+        </div>
+        ${!isEdit && showsBookings ? `
+        <div class="form-group">
+          <button class="btn btn--secondary btn--sm" type="button" data-action="link-booking">
+            <i data-lucide="link" aria-hidden="true"></i> ${esc(t('inventory.linkBooking'))}
+          </button>
+          <div data-picked-booking-chip hidden></div>
+        </div>` : ''}
         <div class="form-group">
           <span class="form-label">${esc(t('inventory.photoLabel'))}</span>
           <div class="inventory-photo-wrap">
@@ -1933,6 +2002,8 @@ function buildItemForm({ mode, item = null }) {
           hint: t('inventory.attachmentsHint'),
         })}`,
       {
+        label: t('modal.moreDetails'),
+        hint: t('inventory.moreDetailsHint'),
         open: isEdit && (!!item.brand || !!item.model || !!item.serial_number || !!item.notes
           || !!item.photo_data || (item.attachments?.length ?? 0) > 0
           // Kilometerstand auf einen Blick zeigen: entweder schon gesetzt,
@@ -1993,8 +2064,10 @@ function buildItemForm({ mode, item = null }) {
       // `change`-Event - nach einem abgebrochenen Zuschnitt ließe sie sich
       // nicht erneut wählen.
       e.target.value = '';
+      let ImageProblemType = null;
       try {
-        const { pickCroppedImage } = await import('/utils/avatar-crop.js');
+        const { pickCroppedImage, ImageProblem } = await import('/utils/avatar-crop.js');
+        ImageProblemType = ImageProblem;
         const cropped = await pickCroppedImage(file, {
           // Nur der Ergebnis-Text ist inventarspezifisch: „Profilbild" wäre
           // für ein Gegenstandsfoto die falsche Vokabel.
@@ -2005,7 +2078,12 @@ function buildItemForm({ mode, item = null }) {
         photoData = cropped;
         renderPhotoPreview();
       } catch (err) {
-        window.yuvomi?.showToast(err.message, 'danger');
+        // Die Pruefung des Bildes sagt ihren Satz; jeder andere Wurf den
+        // allgemeinen, nie seinen eigenen, unuebersetzten Text (#1909).
+        window.yuvomi?.showToast(
+          ImageProblemType && err instanceof ImageProblemType ? err.sentence : t('common.errorGeneric'),
+          'danger',
+        );
       }
     });
     panel.querySelector('#inv-remove-photo')?.addEventListener('click', () => {
@@ -2031,21 +2109,26 @@ function buildItemForm({ mode, item = null }) {
           initialMonth: item.purchase_date ? item.purchase_date.slice(0, 7) : undefined,
         });
         if (!picked) return;
+        const owner = _container;
+        const dialog = captureModalContext();
         try {
           const res = await api.post(`/inventory/items/${item.id}/entries`, {
             entry_id: picked.entry.id, role: picked.role,
           });
           item = res.data;
           renderLinkedEntries(panel, item);
-          await loadItems();
+          await reloadAfterSave(() => loadItems());
           renderList({ repaint: true });
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+          window.yuvomi?.showToast(errorSentence(err), 'danger');
+          await closeIfItemGone(err, item.id, owner, dialog);
         }
       });
       panel.querySelector('[data-linked-entries]').addEventListener('click', async (event) => {
         const button = event.target.closest('[data-remove-entry]');
         if (!button) return;
+        const owner = _container;
+        const dialog = captureModalContext();
         try {
           const res = await api.delete(`/inventory/items/${item.id}/entries/${button.dataset.removeEntry}`);
           item = res.data;
@@ -2053,7 +2136,8 @@ function buildItemForm({ mode, item = null }) {
           await loadItems();
           renderList({ repaint: true });
         } catch (err) {
-          window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+          window.yuvomi?.showToast(errorSentence(err), 'danger');
+          await closeIfItemGone(err, item.id, owner, dialog);
         }
       });
     } else if (showsBookings) {
@@ -2150,20 +2234,63 @@ async function saveItem(panel, mode, item, attachments, pickedBooking, photoData
   };
 
   saveBtn.disabled = true;
+  const owner = _container;
+  const dialog = captureModalContext();
   try {
     if (attachments) payload.attachment_document_ids = await attachments.commit();
     if (pickedBooking) payload.entry_id = pickedBooking.entry.id;
     if (mode === 'create') await api.post('/inventory/items', payload);
     else await api.put(`/inventory/items/${item.id}`, payload);
-    await loadItems();
-    closeSharedModal({ force: true });
+    await reloadAfterSave(() => loadItems());
+    // Nur dieser Dialog, nicht einer, der waehrend der Anfrage aufgegangen
+    // ist (#1997).
+    closeSharedModal({ force: true, context: dialog });
     renderList({ repaint: true, motion: true });
     updateAttentionBadge();
     window.yuvomi?.showToast(mode === 'create' ? t('inventory.created') : t('inventory.updated'), 'success');
   } catch (err) {
     saveBtn.disabled = false;
-    window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
+    const reason = err?.data?.reason;
+    if (reason === 'inventory_selected_location_not_found') {
+      // Der gewaehlte Ort ist weg (#1909): das Formular bleibt offen und bietet
+      // die aktuellen Orte an - mit demselben Helfer wie beim Oeffnen.
+      await offerCurrentLocations(panel);
+    } else if (reason === 'inventory_booking_not_found') {
+      // Die vorgemerkte Buchung ist weg: die Vormerkung faellt, der Rest des
+      // Formulars bleibt stehen.
+      panel.querySelector('[data-clear-picked-booking]')?.click();
+    } else if (mode !== 'create') {
+      await closeIfItemGone(err, item.id, owner, dialog);
+    }
   }
+}
+
+/**
+ * Das Formular gehoert zu einem Gegenstand, den es nicht mehr gibt (#1909):
+ * es geht zu, solange es noch das offene ist, und der Gegenstand faellt aus
+ * der Liste.
+ */
+async function closeIfItemGone(err, itemId, owner, dialog) {
+  if (err?.data?.reason !== 'inventory_item_not_found') return;
+  closeSharedModal({ force: true, context: dialog });
+  await applyGone(err, itemId, owner);
+  refocusAfterRender();
+}
+
+/** Die Orte frisch holen und die Auswahl im offenen Formular neu bauen. */
+async function offerCurrentLocations(panel) {
+  try {
+    await loadLocations();
+  } catch {
+    return;
+  }
+  const select = panel.querySelector('#inv-location');
+  if (!select) return;
+  select.replaceChildren();
+  select.insertAdjacentHTML('beforeend', locationOptionsHtml());
+  select.value = '';
+  select.focus();
 }
 
 async function removeItem(item) {
@@ -2174,7 +2301,14 @@ async function removeItem(item) {
   });
   if (!ok) return;
   try {
-    await api.delete(`/inventory/items/${item.id}`);
+    try {
+      await api.delete(`/inventory/items/${item.id}`);
+    } catch (err) {
+      // SCHON GELOESCHT IST EIN ERFOLG (#1909): ein anderes Haushaltsmitglied
+      // war schneller. Gegenstaende haben keine Sichtbarkeit - die 404 heisst
+      // nur "gibt es nicht mehr". Alles andere bleibt ein Fehler.
+      if (!isAlreadyDeleted(err, 'inventory_item_not_found')) throw err;
+    }
     await loadItems();
     // Die Zeile klappt aus, die Nachbarn ruecken nach - erst dann steht die
     // Liste ohne sie neu (ohne Bewegung loest collapseRow sofort auf).
@@ -2192,7 +2326,7 @@ async function removeItem(item) {
     updateAttentionBadge();
     window.yuvomi?.showToast(t('inventory.deleted'), 'success');
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
   }
 }
 
@@ -2404,7 +2538,7 @@ export async function render(container, { signal } = {}) {
     signal?.addEventListener('abort', () => { _md = null; }, { once: true });
     updateAttentionBadge();
   } catch (err) {
-    window.yuvomi?.showToast(err.data?.error ?? t('common.errorGeneric'), 'danger');
+    window.yuvomi?.showToast(loadErrorSentence(err) ?? t('common.errorGeneric'), 'danger');
     list.replaceChildren();
   }
 }
@@ -2511,4 +2645,6 @@ export const __test = {
   removeItem,
   // Review R11: Kilometerstand-Trend auf der Zeitachse, auch am selben Tag.
   odometerChartMarkup,
+  // #1909: die Fehlerwege laufen ueber eine angezeigte Seite.
+  setContainerForTest(container) { _container = container; },
 };
