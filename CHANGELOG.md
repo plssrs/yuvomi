@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saved order comes back.
 
 ### Fixed
+- **The dashboard no longer waits for the weather**. Until now the dashboard showed nothing
+  until the weather had arrived, and the server waits up to eight seconds for the weather service
+  on each call. When that service was slow or unreachable, the whole dashboard stayed empty for
+  up to sixteen seconds even though everything else had long loaded. The weather now gets less
+  than a second; if it is not there by then, the dashboard appears without it and the weather tile
+  fills in as soon as the answer arrives.
 - **SSO sign-in with Gitea no longer fails with `invalid_client`** (#2144). Yuvomi sends the
   client ID and secret in an HTTP Basic header, form-encoded as RFC 6749 asks. The library did
   that more strictly than the form format and also escaped `-`, `_` and `.`, so a provider that

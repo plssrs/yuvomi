@@ -817,6 +817,44 @@ test('Wetter: nicht eingerichtet - weder im Raster noch in der Ablage, wie ein a
   assert.ok(!edit.chip, 'und auch keinen Chip, der eine leere Kachel zurueckholen wuerde');
 });
 
+test('Wetter: eine haengende Wetteranfrage haelt die Uebersicht nicht auf - das Wetter kommt nach', async () => {
+  // Der Server wartet bis zu 8 s je Abruf auf den Anbieter. Bis dahin stand die
+  // ganze Uebersicht so lange leer; jetzt steht das Raster, und die Kachel wird
+  // nachgetragen, sobald die Antwort da ist.
+  const page = await openPage(harness, { device: 'desktop' });
+  let held = null;
+  page.__yuvomiRequestInterceptor = (req) => {
+    if (!/\/api\/v1\/weather\?/.test(req.url())) return false;
+    held = req;
+    return true;
+  };
+  await saveLayout(page, [{ id: 'weather', size: '2x1' }, { id: 'notes', size: '1x1' }]);
+  await gotoRoute(page, '/');
+  const early = await weatherState(page);
+  const heldBeforeGrid = Boolean(held);
+  page.__yuvomiRequestInterceptor = null;
+  await held?.respond({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      data: {
+        provider: 'open-meteo', city: 'Dortmund', units: 'metric',
+        current: { temp: 20, feels_like: 18, humidity: 47, icon: 'cloud', desc: 'wmo.3', wind_speed: 11 },
+        today: { date: '2026-09-23', temp_min: 13, temp_max: 21, icon: 'cloud', desc: 'wmo.3' },
+        forecast: [{ date: '2026-09-24', temp_min: 14, temp_max: 19, icon: 'cloud', desc: 'wmo.3' }],
+      },
+    }),
+  });
+  await page.waitForSelector('#weather-widget:not(.weather-widget--unavailable)', { timeout: 10000 });
+  const late = await weatherState(page);
+  await page.close();
+
+  assert.ok(heldBeforeGrid, 'Reichweite: die Uebersicht hat das Wetter gar nicht angefragt');
+  assert.ok(early.grid.includes('notes'), `das Raster steht, waehrend das Wetter noch haengt (${early.grid.join(', ')})`);
+  assert.ok(early.tile, 'die Wetterkachel hat ihren Platz schon vor der Antwort');
+  assert.ok(late.tile && !late.unavailable, 'die spaete Antwort fuellt die Kachel');
+});
+
 /* ────────────────────────────────────────────────────────────────────────────
  * Der FAB nach einem Neuaufbau aus der Seite heraus (#1588)
  * ──────────────────────────────────────────────────────────────────────────── */

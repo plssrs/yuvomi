@@ -777,6 +777,15 @@ function setCountdownAvailability(items) {
  * Anfrage selbst scheiterte und der Server gar nichts sagen konnte. */
 let weatherAvailable = false;
 
+/* DAS WETTER HAELT DIE SEITE NICHT AUF. Bis dahin wartete der erste Aufbau auf
+ * /weather, und der Server wartet seinerseits bis zu 8 s je Abruf auf den
+ * Anbieter - haengt open-meteo, blieb die ganze Uebersicht so lange leer, obwohl
+ * alles andere laengst da war. Jetzt bekommt das Wetter eine kurze Frist; wer sie
+ * verpasst, wird nach dem ersten Zeichnen nachgetragen. Im Regelfall antwortet
+ * der Server aus seinem Cache und die Frist greift nie. */
+const WEATHER_WAIT_MS = 800;
+const WEATHER_PENDING = Symbol('weather-pending');
+
 function weatherAvailableFrom(res, prefs) {
   if (res?.data) return true;
   if (res?.reason === 'not_configured') return false;
@@ -7303,6 +7312,16 @@ export async function render(container, { user, signal: routeSignal = null } = {
   let freshAt = null;
   let freshDay = null;
   const markLoaded = (day, { partial = false } = {}) => { lastLoadedAt = new Date(); if (!partial) { freshAt = lastLoadedAt; freshDay = day; } };
+  // Gestartet erst, wenn ein gemerkter Stand fehlt (Promise.all unten).
+  let lateWeather = null;
+  const weatherRequest = () => {
+    lateWeather = api.get(`/weather?lang=${encodeURIComponent(getLocale())}`).catch(() => ({ data: null }));
+    return lateWeather;
+  };
+  let weatherTimer;
+  const weatherDeadline = new Promise((resolve) => {
+    weatherTimer = setTimeout(() => resolve(WEATHER_PENDING), memo ? 0 : WEATHER_WAIT_MS);
+  });
   try {
     const requestDay = householdToday();
     // Aus dem gemerkten Stand dieselben vier Antworten - samt der Slices, die
@@ -7312,7 +7331,8 @@ export async function render(container, { user, signal: routeSignal = null } = {
       ? [memo.data, memo.weatherRes, { data: memo.prefs }, memo.data.pendingReminders]
       : await Promise.all([
         api.get(overviewRequest(layoutHintQuery('/dashboard'))),
-        api.get(`/weather?lang=${encodeURIComponent(getLocale())}`).catch(() => ({ data: null })),
+        // Das Wetter haelt die Seite hoechstens WEATHER_WAIT_MS auf (siehe dort).
+        Promise.race([weatherRequest(), weatherDeadline]),
         // Beim Start hat der Router dieselbe Antwort schon unterwegs und reicht
         // sie herein (utils/start-handoff.js) - sonst zwei `/preferences` je
         // Kaltstart. Danach gibt es nichts mehr abzuholen, und die Seite fragt selbst.
@@ -7340,9 +7360,15 @@ export async function render(container, { user, signal: routeSignal = null } = {
     // übersetzen (Issue #524). Ein gemerkter Stand ist schon uebersetzt.
     if (!memo) localizeEventLists(data);
     setCountdownAvailability(data?.countdowns);
-    weather      = weatherRes.data ?? null;
     weatherPrefs = prefsRes.data ?? null;
-    setWeatherAvailability(weatherRes, weatherPrefs);
+    if (weatherRes === WEATHER_PENDING) {
+      // Noch keine Antwort: ob die Kachel steht, sagen die Praeferenzen. Das
+      // Wetter selbst kommt nach dem ersten Zeichnen (unten, lateWeather).
+      setWeatherAvailability(null, weatherPrefs);
+    } else {
+      weather = weatherRes.data ?? null;
+      setWeatherAvailability(weatherRes, weatherPrefs);
+    }
     weatherAutoLocate = Boolean(prefsRes.data?.weather_user?.auto_locate ?? prefsRes.data?.weather_auto_locate);
     widgetConfig = childDefaultFor(
       normalizeDashboardConfigWithExtensions(prefsRes.data?.dashboard_widgets ?? buildDefaultWidgetConfig()),
@@ -7392,6 +7418,8 @@ export async function render(container, { user, signal: routeSignal = null } = {
     console.error('[Dashboard] Ladefehler:', err.message, 'Status:', err.status ?? 'network');
     loadFailed = true;
     loadErrorStatus = Number.isFinite(err?.status) ? err.status : null;
+  } finally {
+    clearTimeout(weatherTimer);
   }
 
   // Zyklus-Slice strikt owner-only nachladen: Zyklusdaten sind privat und dürfen
@@ -8353,6 +8381,18 @@ export async function render(container, { user, signal: routeSignal = null } = {
     if (wallMode) syncWallMode(location.pathname);
     followDayBoundaries();
   });
+
+  // Das Wetter, das die Frist verpasst hat, nachtragen, sobald es da ist. Ein
+  // Aufbau, der inzwischen ueberholt oder verlassen ist, faesst nichts an.
+  if (!loadFailed && !weather && lateWeather) {
+    lateWeather.then((res) => {
+      if (signal.aborted || !res?.data) return;
+      weather = res.data;
+      setWeatherAvailability(res, weatherPrefs);
+      rememberOverview();
+      rebuildDashboard(widgetConfig);
+    });
+  }
 
   // 30-Minuten Auto-Refresh für Wetter (inkl. optionaler Standort-Aktualisierung).
   // Anker ist der Datensatz, nicht der Karten-Button: seit dem Masthead-Umzug
