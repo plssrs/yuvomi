@@ -1,8 +1,9 @@
 /**
  * Modul: Kalender (Calendar)
  * Zweck: Styles für Monats-/Wochen-/Tages-/Agenda-Ansicht, Termin-Karten, Modal
- * Abhängigkeiten: tokens.css, layout.css
+ * Abhängigkeiten: tokens.css, layout.css, time-grid.css (geteiltes Zeitraster)
  */
+@import url('/styles/time-grid.css');
 
 /* --------------------------------------------------------
  * Modul-Akzent
@@ -131,14 +132,11 @@
  * links und rechts blieben 420px leer, und Mini-Monat, Kalenderliste und „Als
  * Naechstes" gab es nicht. Ab 86.25rem Kalenderflaeche (das 1600er-Fenster
  * neben der ausgeklappten Seitenleiste: 1380px) wird der Kalender eine Flaeche
- * mit Seitenleiste wie Apple Kalender: Kopf und Rahmen ruecken von der
- * Inhaltsspalte auf den Seitenrand (`--page-gutter`), links steht die Leiste
- * (16.25rem, ein Mini-Monat mit 32px-Tagen), rechts das Raster.
- * Gemessen 1920: Leiste 252-512, Raster 536-1888 (vorher 430-1710).
- *
- * DAS IST DIE EINE AUSNAHME VON DER GEMEINSAMEN LINKEN KANTE (R19): die
- * Leiste nimmt den Rand ein, den die Inhaltsspalte sonst leer laesst; ihre
- * Kante ist die, die jedes Modul bei 1280 und 1440 hat. Nur die Suche steht
+ * mit Seitenleiste wie Apple Kalender: links steht die Leiste (16.25rem, ein
+ * Mini-Monat mit 32px-Tagen), rechts das Raster - beide auf der zentrierten
+ * Inhaltsspalte wie jedes Modul (R23, D13: bis dahin rueckten Kopf und Rahmen
+ * auf den Seitenrand, "die eine Ausnahme von der gemeinsamen linken Kante"
+ * aus R19; der Titel sprang beim Modulwechsel um 178px). Nur die Suche steht
  * ohne Leiste. Seit R20 behaelt auch die Agenda sie (ohne „Als Naechstes" -
  * das ist die Agenda selbst): fiel sie weg, sprang der Inhalt beim
  * Ansichtswechsel von x 536 auf 220 (1920px).
@@ -171,10 +169,13 @@
 }
 
 @container cal-page (min-width: 86.25rem) {
-  .calendar-page.has-cal-sidebar > * {
-    --page-inline-pad: var(--page-gutter);
-  }
-
+  /* AUF DER INHALTSSPALTE (R23, D13; Critique G0 S-P2-5). Kopf und Rahmen
+   * rueckten hier auf den Seitenrand (`--page-inline-pad: var(--page-gutter)`),
+   * und der Titel stand bei 1920 auf x 252 statt 430 wie in jedem anderen
+   * Modul, bei 2560 auf 252 statt 750 - er sprang beim Modulwechsel. Jetzt
+   * bleiben beide auf der zentrierten Inhaltsspalte (1280px): Leiste und
+   * Raster teilen sie sich (260 + 24 + 996px), und die Titelkante ist in allen
+   * Modulen dieselbe. */
   .calendar-page.has-cal-sidebar .cal-frame {
     gap: var(--space-6);
     padding-inline: var(--page-inline-pad);
@@ -421,11 +422,9 @@
 /* DIE ANSICHTSWAHL IST DAS KANON-SEGMENT (.segmented, panel.css; D1, Critique
  * 2026-10-16). Hier standen ein eigenes Well (radius-sm, ohne Kante) und eine
  * eigene Aktiv-Pille - die dritte Optik derselben Bedienfrage neben dem
- * Aufgaben-Umschalter und den Dokumenten. Es bleibt die Schriftrolle der
- * Beschriftung (test:typography: mindestens 14px). */
-.cal-toolbar__view-btn {
-  font-size: var(--type-secondary);
-}
+ * Aufgaben-Umschalter und den Dokumenten. Seit R22 (D8) auch die Schrift des
+ * Segments: hier stand die 15px-Sekundaerrolle, jedes andere Segment der App
+ * schreibt 14px (`--text-sm`, panel.css). Keine eigene Regel mehr. */
 
 /* Mobiles Umbrechen kommt jetzt aus .page-toolbar--wrap (layout.css): die
  * Datums-Navigation (.cal-toolbar__month = Center-Slot) rutscht als Gruppe auf
@@ -471,6 +470,11 @@
 
 .cal-toolbar__stepper {
   display: contents;
+}
+
+/* Der Ort steht nur im angedockten Telefonkopf (unten, D20). */
+.cal-toolbar__place {
+  display: none;
 }
 
 /* Die Ansichtswahl als Pop-up gibt es nur mobil (R9 M5) - darueber waehlt das Segment. */
@@ -584,6 +588,75 @@
     flex: 1 1 auto;
     max-width: none;
   }
+
+  /* OHNE `:has()` (Safari < 15.4, Firefox < 121) fiel jede Regel oben, die
+   * `:not(:has(...))` traegt, als Ganzes weg: die Suche blieb ein Feld in
+   * voller Breite, und die eine Zeile, fuer die der kompakte Kopf da ist,
+   * brach um. Hier traegt dieselbe Icon-Form den Stand "Begriff steht" als
+   * Klasse (`is-filled`, utils/page-search.js haelt sie nach). Die
+   * Ansichtswahl bleibt daneben stehen - sie auszublenden braucht den
+   * Elternselektor; das aufgeklappte Feld teilt sich dann die Zeile. */
+  @supports not selector(:has(*)) {
+    .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search:not(:focus-within):not(.is-filled) {
+      flex: 0 0 auto;
+      width: var(--target-base);
+      min-width: var(--target-base);
+      max-width: var(--target-base);
+      block-size: var(--target-base);
+      border: 1.5px solid var(--color-border);
+      border-radius: var(--radius-full);
+    }
+
+    .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search:not(:focus-within):not(.is-filled) .page-search__input {
+      min-height: 0;
+      block-size: calc(var(--target-base) - 2 * 1.5px);
+      padding-inline: 0;
+      border-color: transparent;
+      background: transparent;
+      color: transparent;
+    }
+
+    .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search:not(:focus-within):not(.is-filled) .page-search__icon {
+      inset-inline: 0;
+      margin-inline: auto;
+      color: var(--color-accent);
+    }
+
+    .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search.is-filled {
+      flex: 1 1 auto;
+      max-width: none;
+    }
+  }
+}
+
+/* DIE LUPE MISST WIE IHRE ZEILE (R22, D8). Am Zeiger stehen Pfeile, Filter,
+ * Segment und "+ Termin" auf --target-md (40px); die Icon-Form der Suche hielt
+ * --target-base und stand mit 44px als einziges Ziel ueber die Zeile hinaus.
+ * Am Finger (Tablet quer) bleibt --target-base, wie bei jedem Nachbarn. */
+@media (min-width: 1024px) and (hover: hover) {
+  .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search:not(:focus-within):not(:has(input:not(:placeholder-shown))) {
+    width: var(--target-md);
+    min-width: var(--target-md);
+    max-width: var(--target-md);
+    block-size: var(--target-md);
+  }
+
+  .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search:not(:focus-within):not(:has(input:not(:placeholder-shown))) .page-search__input {
+    block-size: calc(var(--target-md) - 2 * 1.5px);
+  }
+
+  @supports not selector(:has(*)) {
+    .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search:not(:focus-within):not(.is-filled) {
+      width: var(--target-md);
+      min-width: var(--target-md);
+      max-width: var(--target-md);
+      block-size: var(--target-md);
+    }
+
+    .page-toolbar.cal-toolbar--compact .page-toolbar__tools > label.page-search:not(:focus-within):not(.is-filled) .page-search__input {
+      block-size: calc(var(--target-md) - 2 * 1.5px);
+    }
+  }
 }
 
 /* TABLET (768-1023px): ZWEI ZEILEN STATT DREI (Critique 2026-10-16: 182px in
@@ -696,6 +769,7 @@
     align-items: center;
     flex: 1 1 0;
     min-width: 0;
+    min-height: var(--target-base);
     contain: inline-size;
     position: relative;
   }
@@ -785,6 +859,31 @@
     min-width: 0;
   }
 
+  /* NIE EIN KOPF OHNE ORT (DESIGN.md, Kopfregel 1; Critique R22, a1, D20).
+   * Eingeklappt verliess der Titel das Bild, und die Zeile nannte nur noch
+   * „22.10. - 21.11.2026" und „Agenda" - kein Wort, wo man ist. Jetzt steht
+   * „Kalender" als Caption ueber dem Zeitraum, in derselben Zeile; der Stepper
+   * behaelt dabei seine 48px (vorher 48 -> 24px beim Andocken, die Zeile
+   * sprang: Agenda-Scroll-CLS 0,006-0,012). */
+  /* Zwei Zeilen im Stepper per Umbruch, nicht per Richtung: die Richtung im
+   * Kopf gehoert der Shell (test-frontend-audit, "der Modulkopf gehoert der
+   * Shell"). Der Ort nimmt die ganze erste Zeile, der Zeitraum steht darunter. */
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper {
+    flex-wrap: wrap;
+    align-content: center;
+  }
+
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__place {
+    display: block;
+    flex: 0 0 100%;
+    max-inline-size: 100%;
+  }
+
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper > .cal-toolbar__label {
+    flex: 0 1 auto;
+    text-align: start;
+  }
+
   .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper > .period-stepper__prev[data-collapse-fold],
   .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper > .period-stepper__next[data-collapse-fold] {
     display: none;
@@ -806,6 +905,60 @@
    * (320px, Tag: 92 -> 118px). Die Platzhalter verlassen nur den Fluss. */
   .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__view-menu-sizer {
     position: absolute;
+  }
+}
+
+/* NIE EIN KOPF OHNE ORT, AUCH AM TABLET (R22 S10, aus S5 offen). Zwischen 640
+ * und 1023px nannte der angedockte Kopf Suche, Filter, Zeitraum und Ansichten,
+ * aber nicht den Ort. Der Stepper loest sich dort auf (`display: contents`,
+ * oben), die Pfeile bleiben stehen; deshalb ordnet hier der Zeitraum-Slot
+ * selbst: „Kalender" als Caption in der Spalte des Zeitraums ueber dem Label,
+ * Pfeile und „Heute" ueber beide Zeilen. Caption und Label (13 + 24px) passen
+ * in die 48px der Zeile - der Kopf waechst nicht. Die Schrift der Caption gilt
+ * fuer Telefon und Tablet (unten). */
+@media (min-width: 640px) and (max-width: 1023px) {
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed > .page-toolbar__center {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    grid-template-rows: auto auto;
+    align-content: center;
+    align-items: center;
+    row-gap: 0;
+  }
+
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__place {
+    display: block;
+    grid-area: 1 / 2;
+    text-align: center;
+  }
+
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper > .cal-toolbar__label {
+    grid-area: 2 / 2;
+  }
+
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper > .period-stepper__prev {
+    grid-area: 1 / 1 / 3 / 2;
+  }
+
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper > .period-stepper__next {
+    grid-area: 1 / 3 / 3 / 4;
+  }
+
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__stepper > .cal-toolbar__today {
+    grid-area: 1 / 4 / 3 / 5;
+  }
+}
+
+/* Die Caption des Orts im angedockten Kopf, Telefon und Tablet. */
+@media (max-width: 1023px) {
+  .page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__place {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--text-2xs);
+    font-weight: var(--font-weight-semibold);
+    line-height: var(--line-height-tight);
+    color: var(--color-text-secondary);
   }
 }
 
@@ -1115,6 +1268,27 @@
   margin-inline-end: var(--space-0h);
 }
 
+/* DIE SERIENMARKE WEICHT DEM TITEL IM SCHMALEN MONAT (R22 S10, a3 Klein).
+ * Ab 1024px steht der Monatstitel einzeilig; bei 1280 ist die Zelle 141px,
+ * der Balken 132px, und Serienmarke samt Abstand kosteten 18px: 28 von 40
+ * Titeln endeten in der Ellipse ("Klavierstunde - Le..."), ohne die Marke 7.
+ * Unter 9rem Balkenbreite weicht deshalb nur die Serienmarke - das
+ * gewaehlte Terminicon bleibt, es ist Inhalt, die Marke ist Zustand und steht
+ * einen Tipp weiter im Detail. Ab 1440 (155px) ist sie wieder da. Der
+ * Container ist der Balken selbst (blockbreit, die Eindaemmung aendert seine
+ * Breite nicht); ohne Container-Queries bleibt die Marke - Verfeinerung. */
+@media (min-width: 1024px) {
+  .month-grid .month-day__event {
+    container: month-chip / inline-size;
+  }
+
+  @container month-chip (max-width: 9rem) {
+    .month-day__event > .calendar-repeat-icon {
+      display: none;
+    }
+  }
+}
+
 .month-day__more {
   font-size: var(--text-xs);
   color: var(--color-text-secondary);
@@ -1161,54 +1335,6 @@
   flex-shrink: 0;
 }
 
-/* WOCHENTAG UND ZIFFER STEHEN NEBENEINANDER, auf jeder Breite (Critique
- * 2026-09-24). Gestapelt baute der Kopf mobil 71px - bei 3-Tage-Spalten von
- * ~110px Breite stand der Kuerzel mit 12px ueber einer 36px-Ziffer, und die
- * Woche zeigte darunter nur noch 6,5 Stunden. Nebeneinander sind es 44px:
- * eine 32px-Ziffer plus 6px Luft oben und unten. Ab 1024px stand es schon so;
- * jetzt gilt EINE Form statt zwei. */
-.week-view__day-header {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-1h);
-  padding: var(--space-1h) var(--space-1);
-  text-align: center;
-  border-inline-start: 1px solid var(--color-border-subtle);
-  cursor: pointer;
-}
-
-.week-view__day-header:hover .week-view__day-num:not(.week-view__day-num--today) {
-  background-color: var(--color-surface-hover);
-  border-radius: var(--radius-full);
-}
-
-.week-view__day-name {
-  font-size: var(--text-xs);
-  font-weight: var(--font-weight-semibold);
-  color: var(--color-text-secondary);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-label);
-}
-
-.week-view__day-num {
-  font-size: var(--text-lg);
-  font-weight: var(--font-weight-bold);
-  color: var(--color-text-primary);
-  width: var(--target-sm);
-  height: var(--target-sm);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-full);
-  font-variant-numeric: tabular-nums;
-}
-
-.week-view__day-num--today {
-  background-color: var(--color-accent);
-  color: var(--color-ink-on-vivid);
-}
-
 .week-view__scroll {
   flex: 1;
   overflow-y: auto;
@@ -1222,28 +1348,6 @@
   position: relative;
 }
 
-.week-view__times {
-  width: var(--cal-gutter-width);
-  flex-shrink: 0;
-  position: relative;
-}
-
-.week-view__time-slot {
-  height: var(--cal-hour-height);
-  padding-inline-end: var(--space-2);
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-end;
-  padding-top: var(--space-1);
-}
-
-.week-view__time-label {
-  font-size: var(--text-xs);
-  color: var(--color-text-tertiary);
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
 .week-view__columns {
   flex: 1;
   display: grid;
@@ -1255,15 +1359,20 @@
   position: relative;
 }
 
-/* Dezenter Slot-Hover zeigt die leere Zeit als Flaeche, auf der man anlegen
- * kann (seit R17 Z2 per Doppelklick bzw. langem Druck, wireTimeGridCreate in
- * calendar.js); die getönten Event-Blöcke liegen deckend darüber und bleiben
- * lesbar. */
-.week-view__col:hover,
-.day-view__col:hover {
-  /* Im Akzent wie heute und der gewaehlte Tag (Re-Kritik 2026-10-17): Azur
-   * neben Violett las sich wie eine zweite Auswahl. */
+/* DER HOVER IST EIN BAND, NICHT DIE SPALTE (Critique R22, a3 P3, D20). Unter
+ * dem Zeiger steht die Stunde, die ein Doppelklick anlegt (seit R17 Z2 per
+ * Doppelklick bzw. langem Druck, wireTimeGridCreate in calendar.js) - vorher
+ * toente `:hover` die ganze Tagesspalte. Die getoenten Event-Bloecke liegen
+ * deckend darueber und bleiben lesbar. Im Akzent wie heute und der gewaehlte
+ * Tag (Re-Kritik 2026-10-17): Azur neben Violett las sich wie eine zweite
+ * Auswahl. */
+.cal-hover-slot {
+  position: absolute;
+  inset-inline: 0;
+  z-index: 0;
+  border-radius: var(--radius-xs);
   background-color: color-mix(in srgb, var(--color-accent) var(--tint-state), transparent);
+  pointer-events: none;
 }
 
 /* Ein Doppelklick markiert kein Wort und ein langer Druck ruft weder die
@@ -1316,36 +1425,6 @@
     animation: none;
     opacity: 0.6;
   }
-}
-
-.week-view__hour-line {
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background-color: var(--color-border-subtle);
-  pointer-events: none;
-}
-
-.week-view__now-line {
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background-color: var(--color-danger);
-  z-index: 2;
-  pointer-events: none;
-}
-
-.week-view__now-line::before {
-  content: '';
-  position: absolute;
-  inset-inline-start: -4px;
-  top: -4px;
-  width: 10px;
-  height: 10px;
-  border-radius: var(--radius-full);
-  background-color: var(--color-danger);
 }
 
 .week-event {
@@ -1406,13 +1485,6 @@
   outline: var(--focus-ring-width) solid var(--focus-ring-color);
   outline-offset: var(--focus-ring-offset);
   z-index: 3;
-}
-
-/* Der Tageskopf der Woche fuehrt in den Tag (role=button). Ring innen: der
- * Kopf stoesst an Nachbarkoepfe und an die Ganztags-Zeile. */
-.week-view__day-header:focus-visible {
-  outline: var(--focus-ring-width) solid var(--focus-ring-color);
-  outline-offset: var(--focus-ring-offset-inset);
 }
 
 .week-event__title {
@@ -1932,9 +2004,22 @@
 @supports (content-visibility: auto) and (contain-intrinsic-size: auto none auto 1px) {
   .agenda-day + .agenda-day {
     content-visibility: auto;
-    contain-intrinsic-size: auto none auto 160px;
+    contain-intrinsic-size: auto none auto var(--agenda-day-estimate);
     overflow-clip-margin: var(--space-2);
   }
+}
+
+/* Die Schaetzhoehe eines Tages ausser Sicht - EINE Zahl fuer zwei Stellen:
+ * `contain-intrinsic-size` oben und den Platzhalter eines Tages, der im
+ * ersten Aufbau erst nachkommt (R23 S11, utils/row-fill.js). So hat der
+ * Bildlauf vom ersten Bild an dieselbe Laenge wie danach. */
+.agenda-view {
+  --agenda-day-estimate: 160px;
+}
+
+.agenda-view > .row-pending {
+  block-size: var(--agenda-day-estimate);
+  margin-bottom: var(--space-4);
 }
 
 
@@ -2221,7 +2306,7 @@
 }
 
 .event-icon-picker__trigger:active {
-  transform: scale(0.98);
+  transform: scale(var(--press-scale-sm));
 }
 
 .event-icon-picker__trigger i,
@@ -2377,13 +2462,12 @@
     margin-bottom: var(--space-1);
   }
 
-  /* Nur die Polsterung, und die ist eine Abweichung: 8px rundum statt der 8/12
-   * der geteilten Zeile, weil links die Farbkante steht und kein Bedienelement.
-   * Die `min-height` stand hier ein zweites Mal mit demselben Wert - sie kommt
-   * von `.list-row` und ist entfallen, nicht vergessen. */
-  .agenda-event {
-    padding: var(--space-2);
-  }
+  /* Hier stand `padding: var(--space-2)` - 8px rundum statt der 8/12 der
+   * geteilten Zeile, "weil links die Farbkante steht". Die Farbkante haengt
+   * aber am Text (`.agenda-event__body`), nicht an der Zeile, und mit 8px stand
+   * die Agenda als einzige Liste neben Einkauf, Vorrat und Kontakten auf einem
+   * eigenen Einzug (R22, D8). Die Zeile traegt jetzt die Polsterung von
+   * `.list-row`; die `min-height` kommt ebenfalls von dort. */
 
   /* Hier stand `flex-wrap: wrap` - die Erlaubnis, aus der die zweizeilige
    * Metazeile wurde. Der Abstand bleibt schmaler als auf dem Desktop, das
@@ -3022,43 +3106,14 @@
   padding: var(--cal-chip-pad-block) var(--space-1);
 }
 
-/* TABLET: DER TITEL DARF ZWEI ZEILEN NEHMEN (R21, Critique 2026-10-21, D4).
- * Gemessen bei 834px: Zellen 118x170, 51 Chips, 40 davon gekuerzt, im Mittel
- * 12,6 Zeichen sichtbar - "Klavierstun...", "Fussballtrain...". Die Zelle hat
- * die Hoehe, die ihr an Breite fehlt. fitMonthDayCells misst die echte Hoehe
- * und zaehlt, was nicht mehr passt, ins "+N" - zwei Zeilen kosten keine
- * Zusage, nur Platz. Darunter (Telefon) gelten Punkt und Titelfassung, ab
- * 1024px haben die Spalten die Breite fuer eine Zeile. Die Baender
- * (`.month-bands`) bleiben einzeilig: sie stehen in Spuren fester Hoehe ueber
- * mehrere Zellen. Ein langes Wort trennt an der Silbe (W1). */
-@media (min-width: 640px) and (max-width: 1023px) {
-  .month-day .month-day__event,
-  .month-day .cal-task-chip {
-    align-items: flex-start;
-    white-space: normal;
-  }
-
-  .month-day .month-day__event > span:last-child,
-  .month-day .cal-task-chip > span:last-child {
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    white-space: normal;
-    overflow-wrap: break-word;
-    hyphens: auto;
-    hyphenate-limit-chars: 6 4 4;
-    -webkit-hyphenate-limit-before: 4;
-    -webkit-hyphenate-limit-after: 4;
-  }
-
-  /* Glyphe und Rangpunkt stehen an der ERSTEN Zeile, nicht in der Mitte von
-   * zweien: die Zeilenhoehe des Chips (1.4 bzw. 1.3) ist ihre Hoehe. */
-  .month-day .month-day__event > :not(:last-child),
-  .month-day .cal-task-chip > :not(:last-child) {
-    margin-block-start: calc((1lh - 1em) / 2);
-  }
-}
+/* TABLET: EINE ZEILE MIT ELLIPSE (R23, D14 - Entscheidung Ulas 2026-10-24).
+ * R21 (D4) liess den Titel zwischen 640 und 1023px zwei Zeilen nehmen und an
+ * der Silbe trennen; gemessen hiess das "Fussball- / training", Zellen mit
+ * halb so vielen Chips und ein Raster, das je Woche anders hoch war. Der Chip
+ * ist am Tablet wie am Desktop eine Zeile mit Ellipse; den ganzen Titel
+ * nennt der Tag (Antippen) und der Screenreader. Hier stand der Zweizeilen-
+ * Block; `.month-day__event` und `.cal-task-chip` tragen ihre einzeilige
+ * Grundregel (white-space: nowrap, text-overflow: ellipsis) wieder allein. */
 
 /* Aufgaben-Sektion in Agenda-Ansicht (und in der Tagesliste des
  * Telefon-Monats, die dieselben Zeilen baut).
@@ -3262,6 +3317,23 @@
   .month-view:not(.month-view--titles) .cal-task-chip > *,
   .month-view:not(.month-view--titles) .month-day__holiday > * {
     display: none;
+  }
+
+  /* Am Telefon steht die Ziffer mittig im Kreis, darunter die Punkte der
+   * Termine: die Striche der Schichten stehen als eigene, mittige Reihe
+   * zwischen beiden - direkt unter der Ziffer, die in jeder Zelle auf
+   * derselben Hoehe bleibt. In der Titelfassung stehen sie neben ihr. */
+  .month-view:not(.month-view--titles) .month-day__shifts {
+    position: static;
+    justify-content: center;
+    block-size: var(--space-1);
+    margin-block-end: var(--space-0h);
+  }
+
+  .month-view--titles .month-day__shifts {
+    inset-block-start: var(--space-0h);
+    inset-inline-end: var(--space-0h);
+    block-size: var(--space-5);
   }
 
   .month-day .month-day__more {
@@ -3699,6 +3771,45 @@
   flex-direction: column;
 }
 
+/* Legende der Schichtstriche (R23 D14): derselbe Strich wie am Tageskopf,
+   davor das Kuerzel, dann der Name - eine Zeile je Schichtart. */
+.cal-shift-legend {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1h);
+}
+
+.cal-shift-legend__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+}
+
+.cal-shift-legend__item > .month-day__shift {
+  flex: none;
+}
+
+.cal-shift-legend__code {
+  flex: none;
+  min-inline-size: var(--space-6);
+  font-weight: var(--font-weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.cal-shift-legend__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+}
+
 .cal-calendar-manager {
   display: flex;
   flex-direction: column;
@@ -3869,14 +3980,83 @@
   vertical-align: middle;
 }
 
+/* DIE SCHICHT IM MONAT: STRICHE AM TAGESKOPF (Critique R22, a3 P1, D5).
+ * Bis zu drei kurze Striche in der Farbe der Schicht und „+N" stehen am Ende
+ * der Ziffernzeile (absolut in der Zelle: die Ziffer und die Zeilen darunter
+ * bleiben, wo sie waren), statt einer Zeile „F · Linda Johnson" ueber den
+ * Terminen. Der Strich ist Strich und kein Punkt: Punkte sind am Telefon die
+ * Termine. Der Ring haelt die 3:1 gegen die Zellflaeche in jeder Farbe - die
+ * Begruendung der Punktfassung unten gilt hier genauso. Wer welche Schicht
+ * hat, nennen der Name der Zelle, die Tagesliste und der Tag.
+ * Den Bezugsrahmen gibt eine Klasse des Renderers (calendar.js renderMonthDay),
+ * kein `:has()`: ohne `:has()` verloere die Zelle ihn, und alle Striche
+ * stuenden an derselben Ecke (Mindestversion Chrome 87, R22 S10). */
+.month-day--shifts {
+  position: relative;
+}
+
+.month-day__shifts {
+  position: absolute;
+  inset-block-start: var(--space-1);
+  inset-inline-end: var(--space-1h);
+  display: flex;
+  align-items: center;
+  gap: var(--space-0h);
+  block-size: var(--space-6);
+  pointer-events: none;
+}
+
+.month-day__shift {
+  inline-size: var(--space-3);
+  block-size: var(--space-1);
+  border-radius: var(--radius-full);
+  background: var(--holi-color);
+  box-shadow: inset 0 0 0 var(--space-px) var(--color-text-tertiary);
+}
+
+.month-day__shifts-more {
+  font-size: var(--text-2xs);
+  line-height: 1;
+  color: var(--color-text-secondary);
+}
+
+/* Ganztagszeile (Woche/Tag): „F · LJ" steht vor der Uhrzeit und gibt nie
+ * nach. Die Uhrzeit steht ganz oder gar nicht: der Chip ist eine Zeile hoch
+ * und bricht um, was nicht mehr daneben passt - die Uhrzeit landet in einer
+ * zweiten Zeile, die der Chip abschneidet. Gemessen an der Breite, nicht an
+ * einer Zahl: in einer Sprache mit langer Uhrzeit faellt sie frueher weg. */
+.allday-holiday.schedule-entry {
+  flex-wrap: wrap;
+  row-gap: 0;
+  align-content: flex-start;
+  block-size: calc(var(--text-xs) * var(--line-height-tight) + 2 * var(--space-px));
+  line-height: var(--line-height-tight);
+}
+
+.allday-holiday.schedule-entry > .schedule-entry__label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-0h);
+  flex: 0 1 auto;
+}
+
 /* Zeit und Zusatz-Marke treten ueber die Sekundaertinte zurueck, nicht ueber
  * `opacity`: auf der getoenten Flaeche liesse eine 82-%-Deckung den Kontrast
- * mit der Schichtfarbe schwanken, die Sekundaertinte ist gemessen. */
-.allday-holiday .schedule-entry__start {
-  flex: 0 0 auto;
+ * mit der Schichtfarbe schwanken, die Sekundaertinte ist gemessen.
+ *
+ * JEDER CHIP, NICHT NUR DER IM RASTER (R23, Detektor undersized-ui-text): die
+ * Regel hing an `.allday-holiday`. In der Agenda traegt der Chip
+ * `.agenda-holiday`, und das `<small>` fiel dort auf die Vorgabe des Browsers
+ * zurueck - "14:00" in 10px unter der 11px-Grenze. Die Uhrzeit erbt jetzt in
+ * jeder Bauform die Schrift ihres Chips. */
+.schedule-entry__start {
   font: inherit;
   font-variant-numeric: tabular-nums;
   color: var(--color-text-secondary);
+}
+
+.allday-holiday .schedule-entry__start {
+  flex: 0 0 auto;
 }
 
 .schedule-entry__extra-badge {

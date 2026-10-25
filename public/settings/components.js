@@ -55,6 +55,25 @@ export function createDisclosure({
   return section;
 }
 
+/**
+ * DIE ERKLAERUNG VOR DEM ERSTEN FELD IST EIN BIS ZWEI SAETZE (R22, D13).
+ * Wandtabletts und API-Zugriff begannen mit sieben bis neun Zeilen Fussnote,
+ * bevor das erste Feld kam. Der Kern steht als Hinweis da, der Rest hinter
+ * "Mehr dazu" - ein natives `<details>` (Tastatur und Ansage ohne Skript),
+ * der Pfeil zeigt die Richtung. `moreHtml` ist fertiges, escaptes Markup
+ * (Absaetze, auch leere Halter, die der Aufrufer spaeter fuellt).
+ */
+export function hintFoldHtml({ lead, moreHtml, className = '' }) {
+  return `
+    <div class="settings-hint-fold${className ? ` ${esc(className)}` : ''}">
+      <p class="form-hint">${esc(lead)}</p>
+      <details class="settings-hint-fold__more">
+        <summary class="settings-hint-fold__summary">${esc(t('settings.hintMore'))}<i data-lucide="chevron-down" class="settings-hint-fold__icon" aria-hidden="true"></i></summary>
+        <div class="settings-hint-fold__body">${moreHtml}</div>
+      </details>
+    </div>`;
+}
+
 // Ein Schalter, eine Form. Vorher erfand jedes Blatt seine eigene: `toggle-row`,
 // `settings-toggle`, der iOS-Switch aus `toggle`/`toggle__track` und nackte
 // Checkboxen standen für dieselbe Boolean-Entscheidung nebeneinander (Critique
@@ -269,6 +288,60 @@ export function formSwitchRowHtml({ hint = '', hintId = null, ...toggle }) {
     + toggleRowHtml({ ...toggle, control: 'switch', attrs })
     + (hint ? `<p class="form-hint form-switch__hint"${attrsHtml({ id: hintId })}>${esc(String(hint))}</p>` : '')
     + '</div>';
+}
+
+/**
+ * EINE DATEIWAHL (Critique R23, D8, G6-2): die Ablagezone der Sicherung - ein
+ * grosses Label ueber dem versteckten `input[type=file]`, mit Ablage per Ziehen
+ * und der gewaehlten Datei darunter. Das native Feld ("Datei auswaehlen, keine
+ * ausgewaehlt") stand daneben als zweiter Dialekt. Texte laufen durch `esc()`.
+ *
+ * @param {{ id: string, inputId: string, accept: string, title: string, titleTouch?: string, hint?: string, icon?: string }} opts
+ */
+export function fileDropzoneHtml({ id, inputId, accept, title, titleTouch = title, hint = '', icon = 'upload-cloud' }) {
+  return `<label class="settings-backup-dropzone" id="${esc(id)}" for="${esc(inputId)}">`
+    + `<i data-lucide="${esc(icon)}" aria-hidden="true"></i>`
+    + `<span><span class="u-pointer-only">${esc(title)}</span><span class="u-touch-only">${esc(titleTouch)}</span></span>`
+    + (hint ? `<small>${esc(hint)}</small>` : '')
+    + '</label>'
+    + `<input class="sr-only" type="file" id="${esc(inputId)}" accept="${esc(accept)}" />`
+    + `<div class="settings-backup-file" data-dropzone-file="${esc(inputId)}" hidden></div>`;
+}
+
+/**
+ * Verdrahtet `fileDropzoneHtml`: Ziehen hebt die Zone hervor, Ablegen setzt die
+ * Datei ins Feld, und die gewaehlte Datei steht unter der Zone. `onFile(file|null)`
+ * bekommt jede Aenderung. Gibt `reset()` zurueck (nach `form.reset()` aufrufen).
+ */
+export function wireFileDropzone(root, inputId, { onFile = () => {}, describe = (file) => file.name } = {}) {
+  const input = root.querySelector(`#${inputId}`);
+  const dropzone = input?.previousElementSibling;
+  const selected = root.querySelector(`[data-dropzone-file="${inputId}"]`);
+  if (!input || !dropzone) return { reset() {} };
+  const show = (file) => {
+    if (selected) {
+      selected.hidden = !file;
+      selected.textContent = file ? describe(file) : '';
+    }
+    onFile(file ?? null);
+  };
+  input.addEventListener('change', () => show(input.files?.[0]));
+  dropzone.addEventListener('dragover', (event) => {
+    event.preventDefault();
+    dropzone.classList.add('settings-backup-dropzone--active');
+  });
+  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('settings-backup-dropzone--active'));
+  dropzone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dropzone.classList.remove('settings-backup-dropzone--active');
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+    show(file);
+  });
+  return { reset: () => show(null) };
 }
 
 export function createSettingRow({ label, description, control }) {

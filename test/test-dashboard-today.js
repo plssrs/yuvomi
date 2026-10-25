@@ -975,3 +975,71 @@ test('R20: die Seite setzt den Betrachter, den das Heute-Blatt fragt', () => {
   assert.match(src, /viewer = dashboardViewer,\n\} = \{\}\) \{/, 'buildTodayCockpitModel faellt auf den gesetzten Betrachter zurueck');
   assert.match(src, /buildTodayProgram\(data, \{ includeTasks, includeCalendar, includeMeals, now, viewer \}\)/);
 });
+
+// R22 D16 (Critique 2026-10-22, a1 P2): das zweispaltige Blatt liess bei
+// ungerader Zahl rechts unten eine leere Zelle, und die Einkaufszeile stand
+// hinter „+N weitere heute", als waere sie eine der verdeckten Zeilen.
+test('R22 D16: ungerade Zahl - die letzte Zeile spannt; der Einkauf steht vor dem Aufklapper', inBrowser(THU_10_BERLIN, 'Europe/Berlin', () => {
+  const events = Array.from({ length: 9 }, (_, i) => ev(i + 1, `T${i + 1}`,
+    `2026-09-24T${String(11 + i).padStart(2, '0')}:00`, `2026-09-24T${String(11 + i).padStart(2, '0')}:30`));
+  const sheet = dash.renderTodayCockpit({ upcomingEvents: events, urgentTasks: [], users: [], shoppingOpenCount: 3 }, [], false,
+    { now: new Date(), cap: 5, moreOpen: false });
+  assert.match(sheet, /today-cockpit__rows--split" style="--today-rows-per-column:2"/, 'fuenf Zeilen: zwei je Spalte');
+  const classes = [...sheet.matchAll(/class="today-cockpit-card today-cockpit-card--event([^"]*)"/g)].slice(0, 5).map((m) => m[1].trim());
+  assert.deepEqual(classes, ['', '', 'today-cockpit-card--col2 today-cockpit-card--col-start', 'today-cockpit-card--col2', 'today-cockpit-card--span'],
+    'links zwei, rechts zwei, die fuenfte ueber die volle Breite');
+  const shopping = sheet.indexOf('today-cockpit-card--shopping');
+  const more = sheet.indexOf('class="today-cockpit__more');
+  assert.ok(shopping > 0 && more > 0, 'Vorbedingung: Einkauf und „+N weitere heute" stehen im Blatt');
+  assert.ok(shopping < more, 'der Einkauf schliesst das sichtbare Programm, der Weg zu den uebrigen das Blatt');
+
+  const even = dash.renderTodayCockpit({ upcomingEvents: events.slice(0, 4), urgentTasks: [], users: [] }, [], false, { now: new Date(), cap: 5 });
+  assert.doesNotMatch(even, /today-cockpit-card--span/, 'gerade Zahl: nichts spannt');
+}));
+
+test('R22 D16: die Spalte trennt, nicht die Zeile - eingerueckte Trenner je Spalte', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8'))]
+    .filter((r) => r.at.some((a) => /today-cockpit \(min-width: 720px\)/.test(a)));
+  const body = (sel) => rules.find((r) => r.selector.trim() === sel)?.body ?? '';
+  assert.match(body('.today-cockpit__rows--split > .today-cockpit-card + .today-cockpit-card'), /border-top:\s*none/,
+    'keine Haarlinie ueber beide Spalten');
+  const inset = body('.today-cockpit__rows--split > .today-cockpit-card:not(:first-child):not(.today-cockpit-card--col-start)::before');
+  assert.match(inset, /inset-inline:\s*var\(--space-4\)/, 'der Trenner endet vor dem Spaltentrenner');
+  assert.match(body('.today-cockpit__rows--split > .today-cockpit-card--span'), /grid-column:\s*1 \/ -1/);
+});
+
+// R23 (Critique G1 P2): die Titel des Blatts standen je Zeile 12px versetzt -
+// die erste Spalte war `auto`, und ein Siegel mit Avatar ist breiter als eines
+// allein. Mobil stand die erste Zeile bei y 226: Werkzeuge ueber dem Datum,
+// die Wetterzeile in einer eigenen Zeile, „Heute wichtig" darueber.
+test('R23: eine Titelkante im Blatt, mobil Wetter neben den Werkzeugen und keine sichtbare Blatt-Ueberschrift', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const all = [...eachRule(readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8'))];
+  const rules = all.filter((r) => !r.at.length);
+  const card = rules.filter((r) => r.selector.trim() === '.today-cockpit-card' && /grid-template-columns/.test(r.body)).at(-1);
+  const columns = /grid-template-columns:\s*([^;]+)/.exec(card?.body ?? '')?.[1] ?? '';
+  assert.ok(columns && !/^auto\b/.test(columns.trim()), `die Siegelspalte ist fest, nicht auto (${columns})`);
+  assert.match(columns, /var\(--target-sm\)\s*\+\s*var\(--space-5\)\s*-\s*var\(--space-2\)/, 'so breit wie das Paar aus Siegel und Avatar (.seal-pair)');
+  const header = rules.filter((r) => r.selector.trim() === '.dashboard-overview__header' && /grid-template-areas/.test(r.body)).at(0);
+  assert.match(header?.body ?? '', /"date\s+tools"\s*"weather\s+tools"\s*"title\s+title"/, 'mobil: Datum und Wetter in der Hoehe der Knoepfe, der Gruss darunter');
+  const hidden = all.find((r) => r.selector.trim() === '.today-cockpit:not(.today-cockpit--editing) > .today-cockpit__header');
+  assert.ok(hidden && hidden.at.some((a) => /max-width:\s*639px/.test(a)), 'nur am Telefon');
+  assert.match(hidden.body, /position:\s*absolute/);
+  assert.match(hidden.body, /clip:\s*rect\(0,\s*0,\s*0,\s*0\)/, 'die Ueberschrift bleibt im Dokument, nur nicht im Bild');
+});
+
+// R23 (Critique G1 P3): dieselbe Regel fuer die Eltern-Sicht - neben hohen
+// Nachbarn stand „2 zu bestaetigen" 230px unter den Punktestaenden (1440).
+test('R22 D16 + R23: die Anfrage folgt den Punkten - im Kindkonto wie in der Eltern-Sicht', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { eachRule } = await import('./css-rules.js');
+  const rules = [...eachRule(readFileSync(new URL('../public/styles/dashboard.css', import.meta.url), 'utf8'))].filter((r) => !r.at.length);
+  const footer = rules.filter((r) => r.selector.split(',').some((s) => /\.rewards-widget\b[^,]*\.rewards-widget__footer/.test(s)));
+  const last = footer.filter((r) => /margin-block-start/.test(r.body)).at(-1);
+  assert.ok(last, 'Vorbedingung: eine Regel setzt den Abstand des Fusses');
+  assert.match(last.selector, /^\s*\.dashboard \.rewards-widget > \.rewards-widget__footer\s*$/, 'die Regel gilt jeder Belohnungskachel, nicht nur der eigenen');
+  assert.match(last.body, /margin-block-start:\s*0/, 'kein margin-block-start: auto unter Punkten und Balken');
+});

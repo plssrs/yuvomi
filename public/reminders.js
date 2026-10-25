@@ -6,10 +6,11 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate } from '/i18n.js';
+import { t } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { isPushSubscribed } from '/push.js';
 import { moduleIconEl } from '/nav-icons.js';
-import { toastSurface } from '/utils/toast-surface.js';
+import { toastSurface, capPersistentToasts } from '/utils/toast-surface.js';
 import { dashboardRequest, fetchPendingReminders, forgetPendingReminders } from '/utils/dashboard-widgets.js';
 import { wallShowsOn } from '/utils/wall-mode.js';
 
@@ -283,7 +284,7 @@ function cycleReminderBody(reminder) {
   if (reminder.entity_type === 'cycle_period') {
     if (reminder.cycle_anchor_kind === 'partner_period') {
       if (reminder.cycle_owner_name) {
-        return t('health.cycle.status.partnerNextPeriod', { name: reminder.cycle_owner_name, date: formatDate(reminder.entity_title) });
+        return t('health.cycle.status.partnerNextPeriod', { name: reminder.cycle_owner_name, date: dateText(reminder.entity_title) });
       }
       return `${t('health.cycle.status.partnerNextPeriodNeutral')} - ${reminder.entity_title}`;
     }
@@ -322,8 +323,8 @@ function showReminderToast(reminder) {
   const container = toastSurface('polite');
   if (!container) return false;
 
-  const existing = container.querySelectorAll('.toast');
-  if (existing.length >= 3) existing[0].remove();
+  // Platz macht nur eine aeltere Erinnerung, nie die Rueckmeldung daneben.
+  capPersistentToasts(container);
 
   const toast = document.createElement('div');
   toast.className = 'toast toast--reminder';

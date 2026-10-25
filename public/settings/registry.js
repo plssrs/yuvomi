@@ -104,7 +104,8 @@ export const SETTINGS_SCOPES = Object.freeze(['mine', 'household']);
  * zeigen (shell.js, revealSettingsOption). Als Objekt: `also` sind weitere
  * Schluessel, die nur mitgesucht werden (die drei Werte des Theme-Segments),
  * `terms` Produktnamen, die in keiner Sprache uebersetzt werden (Mealie,
- * CalDAV) und deshalb kein Schluessel sind. `test:settings-copy` haelt, dass
+ * CalDAV) und deshalb kein Schluessel sind. `synonyms` ist ein Schluessel mit
+ * den Woertern, die man in der eigenen Sprache dafuer tippt (R23). `test:settings-copy` haelt, dass
  * jeder Schluessel in SEINEM Abschnitt gerendert wird.
  *
  * `labelKey`/`descriptionKey` sind die Namen der frueheren Blaetter: die Suche
@@ -126,7 +127,7 @@ export const SETTINGS_SECTIONS = freezeEntries([
       'settings.displayNameLabel',
       'settings.colorLabel',
       { key: 'settings.contactDetailsLegend', also: ['settings.memberPhoneLabel', 'settings.memberEmailLabel', 'settings.memberBirthDateLabel'] },
-      'settings.changePassword',
+      { key: 'settings.changePassword', synonyms: 'settingsSynonyms.password' },
       { key: 'settings.twoFactorTitle', terms: ['2FA', 'TOTP'] },
       'settings.otherSessionsTitle',
       { key: 'settings.oidcLinkTitle', terms: ['SSO', 'OIDC'] },
@@ -141,14 +142,14 @@ export const SETTINGS_SECTIONS = freezeEntries([
     labelKey: 'settings.pageAppearance',
     descriptionKey: 'settings.pageAppearanceDescription',
     options: [
-      { key: 'settings.sectionDesign', also: ['settings.themeSystem', 'settings.themeLight', 'settings.themeDark'] },
+      { key: 'settings.sectionDesign', also: ['settings.themeSystem', 'settings.themeLight', 'settings.themeDark'], synonyms: 'settingsSynonyms.theme' },
       'settings.localeLabel',
       'settings.dataLanguageLabel',
       'settings.regionLabel',
       'settings.currencyLabel',
-      'settings.timezoneLabel',
+      { key: 'settings.timezoneLabel', synonyms: 'settingsSynonyms.timezone' },
       'settings.dateFormatLabel',
-      'settings.timeFormatLabel',
+      { key: 'settings.timeFormatLabel', synonyms: 'settingsSynonyms.timeFormat' },
     ],
     adminOnly: false,
     loader: () => import('/settings/pages/personal-appearance.js'),
@@ -160,7 +161,7 @@ export const SETTINGS_SECTIONS = freezeEntries([
     labelKey: 'settings.pageDevice',
     descriptionKey: 'settings.pageDeviceDescription',
     options: [
-      { key: 'settings.pwaInstallTitle', terms: ['PWA'] },
+      { key: 'settings.pwaInstallTitle', terms: ['PWA'], synonyms: 'settingsSynonyms.install' },
     ],
     adminOnly: false,
     loader: () => import('/settings/pages/personal-device.js'),
@@ -174,7 +175,7 @@ export const SETTINGS_SECTIONS = freezeEntries([
     labelKey: 'settings.sectionDeviceDisplay',
     descriptionKey: 'settings.wallModeHint',
     options: [
-      'settings.wallModeLabel',
+      { key: 'settings.wallModeLabel', synonyms: 'settingsSynonyms.wallMode' },
       'settings.screensaverIdleLabel',
       'settings.screensaverClockLabel',
       'settings.screensaverCoverLabel',
@@ -190,7 +191,7 @@ export const SETTINGS_SECTIONS = freezeEntries([
     labelKey: 'settings.pageNotifications',
     descriptionKey: 'settings.pageNotificationsDescription',
     options: [
-      'settings.pushToggleTitle',
+      { key: 'settings.pushToggleTitle', synonyms: 'settingsSynonyms.push' },
       { key: 'settings.notificationChannelsTitle', terms: ['ntfy', 'Gotify', 'Webhook'] },
     ],
     adminOnly: false,
@@ -477,7 +478,10 @@ export const SETTINGS_SECTIONS = freezeEntries([
     // CalDAV und Google/Apple haengen an Zugangsdaten des Haushalts, ihre
     // Routen tragen `requireAdmin`.
     id: 'sync-calendar',
-    sheetId: 'module-calendar',
+    // EIN EIGENES BLATT (R23 D14, Critique G6 P2: Kalender-Blatt 3473px, 12
+    // Karten). Konten, Anbieter und die nachtraegliche Zuweisung sind eine
+    // eigene Aufgabe des Haushalts, keine Vorgabe des Kalenders.
+    sheetId: 'module-calendar-sync',
     scope: 'household',
     labelKey: 'settings.pageSyncCalendar',
     descriptionKey: 'settings.pageSyncCalendarDescription',
@@ -784,6 +788,9 @@ export const SETTINGS_LEAVES = freezeEntries([
   { id: 'modules-navigation', domainId: 'modules', path: '/settings/modules/navigation', labelKey: 'settings.pageNavigation', descriptionKey: 'settings.pageNavigationDescription', icon: 'panel-left' },
   { id: 'module-dashboard', domainId: 'modules', path: '/settings/modules/overview', labelKey: 'nav.dashboard', descriptionKey: 'settings.sheetDashboardDescription', icon: 'layout-dashboard', module: 'dashboard' },
   { id: 'module-calendar', domainId: 'modules', path: '/settings/modules/calendar', labelKey: 'nav.calendar', descriptionKey: 'settings.sheetCalendarDescription', icon: 'calendar', module: 'calendar' },
+  // Direkt hinter dem Kalender (gleiches Modul, stabile Sortierung), eigene
+  // Adresse: die OAuth-Rueckkehr und die Alt-Pfade landen hier.
+  { id: 'module-calendar-sync', domainId: 'modules', path: '/settings/modules/calendar-sync', labelKey: 'settings.pageSyncCalendar', descriptionKey: 'settings.pageSyncCalendarDescription', icon: 'refresh-cw', module: 'calendar', moduleStatus: false },
   { id: 'module-tasks', domainId: 'modules', path: '/settings/modules/tasks', labelKey: 'nav.tasks', descriptionKey: 'settings.sheetTasksDescription', icon: 'check-square', module: 'tasks' },
   { id: 'module-rewards', domainId: 'modules', path: '/settings/modules/rewards', labelKey: 'nav.rewards', descriptionKey: 'settings.sheetRewardsDescription', icon: 'award', module: 'rewards' },
   { id: 'module-schedule', domainId: 'modules', path: '/settings/modules/schedule', labelKey: 'nav.schedule', descriptionKey: 'settings.sheetScheduleDescription', icon: 'briefcase-business', module: 'schedule' },
@@ -823,7 +830,7 @@ const MOVED_SETTINGS_PATHS = Object.freeze({
   '/settings/personal/navigation': { path: '/settings/modules/navigation', section: 'modules-navigation' },
   '/settings/modules/options': { path: '/settings/modules/budget', section: 'options-budget', dissolved: true },
   '/settings/modules/countdowns': { path: '/settings/modules/overview', section: 'modules-countdowns' },
-  '/settings/sync/calendar': { path: '/settings/modules/calendar', section: 'sync-calendar' },
+  '/settings/sync/calendar': { path: '/settings/modules/calendar-sync', section: 'sync-calendar' },
   '/settings/sync/contacts': { path: '/settings/modules/contacts', section: 'sync-contacts' },
   '/settings/sync/reminders': { path: '/settings/modules/tasks', section: 'sync-reminders' },
   '/settings/sync/storage': { path: '/settings/modules/documents', section: 'documents-storage' },
@@ -1079,6 +1086,41 @@ export function readStoredSettingsDestination(user, storage = sessionStorage) {
 }
 
 /**
+ * DIESER EINTRAG ZEIGTE DIE UEBERSICHT (Critique R22, D2). Das zuletzt
+ * besuchte Blatt wird nur beim Einstieg von aussen wiederhergestellt; ein
+ * Zurueck auf einen Eintrag, der die Uebersicht zeigte, folgt der Adresse.
+ * Vorher sprang Zurueck aus einem Blatt auf `/settings` - und die
+ * Wiederherstellung schickte sofort wieder ins Blatt: Uebersicht ->
+ * Darstellung -> Zurueck blieb auf /settings/personal/appearance (gemessen
+ * mobil, a5 P1). Der Merker steht im History-State, nicht im Speicher: er
+ * gilt genau fuer diesen Eintrag und ueberlebt ein Neuladen. Der uebrige
+ * State (`path`, `scrollKey`) bleibt.
+ */
+export const SETTINGS_OVERVIEW_MARK = 'settingsOverview';
+
+export function settingsOverviewShown(state) {
+  return Boolean(state && typeof state === 'object' && state[SETTINGS_OVERVIEW_MARK] === true);
+}
+
+export function withSettingsOverviewMark(state) {
+  return { ...(state && typeof state === 'object' ? state : {}), [SETTINGS_OVERVIEW_MARK]: true };
+}
+
+/**
+ * Merkt den laufenden Eintrag als Uebersicht - nur, solange er `/settings`
+ * IST: am Desktop hat preselectSheet() die Adresse schon auf das erste Blatt
+ * gestellt, dann ist der Eintrag keine Uebersicht mehr.
+ */
+export function markSettingsOverviewEntry(hist = globalThis.history, loc = globalThis.location) {
+  if (!hist || loc?.pathname !== '/settings' || settingsOverviewShown(hist.state)) return;
+  try {
+    hist.replaceState(withSettingsOverviewMark(hist.state), '');
+  } catch {
+    // Ohne Merker stellt ein spaeteres Zurueck wieder her - wie bisher.
+  }
+}
+
+/**
  * Vergleichsform der Suche: Kleinschreibung, Diakritika weg, damit "wetter"
  * auch "Wetter" findet und "prazdniny" auch "prázdniny".
  */
@@ -1093,7 +1135,7 @@ export function normalizeSettingsSearch(value) {
 function optionEntry(option) {
   return typeof option === 'string'
     ? { key: option, also: [], terms: [] }
-    : { key: option.key, also: option.also ?? [], terms: option.terms ?? [] };
+    : { key: option.key, also: option.also ?? [], terms: option.terms ?? [], synonyms: option.synonyms ?? null };
 }
 
 /**
@@ -1137,7 +1179,11 @@ export function searchSettings(query, { user, translate }) {
       }
       for (const option of (section.options ?? []).map(optionEntry)) {
         const optionLabel = translate(option.key);
-        const haystack = [optionLabel, ...option.also.map(translate), ...option.terms].join(' ');
+        // SYNONYME (R23 S10, Critique G6 P3 "Suche ohne Synonyme"): "Dark
+        // Mode" fand kein "Design", "Kennwort" kein "Passwort aendern". Ein
+        // Schluessel je Option mit den Woertern, die Menschen in DIESER
+        // Sprache dafuer tippen - uebersetzt, anders als `terms`.
+        const haystack = [optionLabel, ...option.also.map(translate), ...option.terms, option.synonyms ? translate(option.synonyms) : ''].join(' ');
         if (hit(haystack)) options.push({ leaf, section, key: option.key, label: optionLabel });
       }
     }

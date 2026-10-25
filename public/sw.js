@@ -19,7 +19,7 @@
  *   → bypassCacheUntil (in-memory + Cache API für SW-Restart-Robustheit)
  */
 
-const APP_RELEASE        = '2.79.0';
+const APP_RELEASE        = '2.80.0';
 const APP_BUILD_REVISION = '__YUVOMI_BUILD_REVISION__';
 const CACHE_RELEASE      = `${APP_RELEASE}-${APP_BUILD_REVISION}`;
 const SHELL_CACHE        = `yuvomi-shell-${CACHE_RELEASE}`;
@@ -84,6 +84,7 @@ const APP_SHELL = [
   '/styles/meals.css',
   '/styles/calendar.css',
   '/styles/schedule.css',
+  '/styles/time-grid.css',
   '/styles/markdown-toolbar.css',
   '/styles/notes.css',
   '/styles/contacts.css',
@@ -139,6 +140,7 @@ const APP_SHELL = [
   '/utils/date.js',
   '/utils/digits.js',
   '/utils/day-label.js',
+  '/utils/date-format.js',
   '/utils/currency-codes.js',
   '/utils/calendar-delete.js',
   '/utils/document-expiry.js',
@@ -174,11 +176,13 @@ const APP_SHELL = [
   '/utils/health-nutrition.js',
   '/utils/health-overview.js',
   '/utils/health-person-switcher.js',
+  '/utils/health-person.js',
   '/utils/health-prevention.js',
   '/utils/health-tabs.js',
   '/utils/health-vitals.js',
   '/utils/help.js',
   '/utils/household-zone-hint.js',
+  '/utils/first-steps.js',
   '/utils/household.js',
   '/utils/html-escape.js',
   '/utils/html.js',
@@ -204,6 +208,7 @@ const APP_SHELL = [
   '/utils/metric-card.js',
   '/utils/metric-glance.js',
   '/utils/money.js',
+  '/utils/amount-field.js',
   '/utils/nav-badges.js',
   '/utils/note-category-filter.js',
   '/utils/note-category-name.js',
@@ -238,6 +243,7 @@ const APP_SHELL = [
   '/utils/router-navigate.js',
   '/utils/roving-toolbar.js',
   '/utils/row-action.js',
+  '/utils/row-fill.js',
   '/utils/schedule-tabs.js',
   '/utils/schedule-reminder-offset.js',
   '/utils/screensaver-idle.js',
@@ -261,6 +267,8 @@ const APP_SHELL = [
   '/utils/reload-after-save.js',
   '/utils/background-inert.js',
   '/utils/today-sheet.js',
+  '/utils/shift-label.js',
+  '/utils/time-grid.js',
   '/utils/unknown-route.js',
   '/utils/page-mount.js',
   '/utils/ux.js',

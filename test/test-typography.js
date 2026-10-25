@@ -631,8 +631,17 @@ test('lange Inhalts- und interaktive Texte verwenden mindestens die Sekundärrol
     assertTypeRole(recipes, 'recipes.css', selector, '--type-body',
       `${selector} muss die 16px-Bodyrolle verwenden`);
   }
-  assertTypeRole(calendar, 'calendar.css', '.cal-toolbar__view-btn', '--type-secondary',
-    'interaktive Kalender-Ansichtsschalter müssen mindestens 14px groß sein');
+  // Die Kalender-Ansichtswahl ist das Segment der Shell und schreibt seit R22
+  // (D8) wie jedes Segment 14px (`--text-sm` an `.segmented__item`, panel.css);
+  // die eigene 15px-Regel ist entfallen. Gehalten wird hier, dass sie nicht
+  // zurueckkommt - die Mindestgroesse steht an der Segment-Regel.
+  const panel = readFileSync(new URL('../public/styles/panel.css', import.meta.url), 'utf8');
+  assertTypeRole(panel, 'panel.css', '.segmented__item', '--text-sm',
+    'Segmente schreiben ueberall 14px - die Kompakt-Interaktion, nicht kleiner');
+  const ownCalSize = [...eachRule(calendar)]
+    .filter((r) => r.selector.split(',').some((x) => /\.cal-toolbar__view-btn(?![\w-])/.test(x)) && /font-size:/.test(r.body));
+  assert.deepEqual(ownCalSize.map((r) => r.selector.trim()), [],
+    'die Kalender-Ansichtswahl setzt wieder eine eigene Schriftgroesse - Segmente schreiben ueberall 14px');
 });
 
 test('globale Toolbar- und Kartentitel folgen den semantischen Rollen', () => {
@@ -795,7 +804,6 @@ const BREAKS_WITHOUT_HYPHENS = {
   '.health-dose__name': 'LEGACY',
   '.health-nutrition-progress__label': 'LEGACY',
   '.health-nutrition-row__title': 'LEGACY',
-  '.search-scope': 'LEGACY',
   '.split-view__detail-title': 'LEGACY',
   '.note-card__title': 'LEGACY',
   '.note-category-badge__name': 'LEGACY',
@@ -1251,7 +1259,7 @@ test('R21: prefers-contrast: more hebt Sekundaer- und Tertiaertext eine Rampenst
 // Gemessen: Tab-Labels 11px am Tablet, Kalender-Chips 12px auf im Mittel 12,6
 // sichtbare Zeichen (40 von 51 gekuerzt) in 118x170er Zellen, Budget-Summen,
 // Plan und Veraenderung 12px, Darlehen-Meta 12px, Aufgaben in der Agenda 12px.
-test('R21 Inge: am Tablet keine Lesezeile unter 13, Nav-Label 12, Monatstitel zweizeilig', () => {
+test('R21 Inge: am Tablet keine Lesezeile unter 13, Nav-Label 12; R23: Monatstitel einzeilig', () => {
   const rules = (name) => [...eachRule(readFileSync(new URL(name, STYLES_DIR), 'utf8'))];
   const sels = (rule) => rule.selector.split(',').map((s) => s.trim());
 
@@ -1261,14 +1269,13 @@ test('R21 Inge: am Tablet keine Lesezeile unter 13, Nav-Label 12, Monatstitel zw
 
   const tablet = (r) => r.at.some((a) => /min-width:\s*640px/.test(a) && /max-width:\s*1023px/.test(a));
   const cal = rules('calendar.css');
-  const titel = cal.find((r) => tablet(r) && sels(r).includes('.month-day .month-day__event > span:last-child'));
-  assert.ok(titel, 'am Tablet eine Titelregel fuer die Chips der Monatszelle');
-  assert.ok(sels(titel).includes('.month-day .cal-task-chip > span:last-child'), 'Aufgaben-Chips ziehen mit');
-  assert.match(titel.body, /-webkit-line-clamp:\s*2/);
-  assert.match(titel.body, /white-space:\s*normal/);
-  assert.match(titel.body, /hyphens:\s*auto/, 'ein langes Wort trennt an der Silbe (W1)');
-  const chip = cal.find((r) => tablet(r) && sels(r).includes('.month-day .month-day__event'));
-  assert.match(chip?.body ?? '', /white-space:\s*normal/, 'der Chip selbst haelt den Titel nicht mehr einzeilig');
+  // R23 (D14): am Tablet EINE Zeile mit Ellipse - der Zweizeilen-Block (R21 D4)
+  // ist entfallen, die Grundregel des Chips gilt wieder allein.
+  const zweizeilig = cal.filter((r) => tablet(r) && sels(r).some((s) => /\.month-day \.(?:month-day__event|cal-task-chip)/.test(s)));
+  assert.deepEqual(zweizeilig.map((r) => r.selector), [], 'keine Tablet-Ausnahme fuer die Chips der Monatszelle');
+  const grund = cal.find((r) => !r.at.length && r.selector.trim() === '.month-day__event');
+  assert.match(grund?.body ?? '', /white-space:\s*nowrap/);
+  assert.match(grund?.body ?? '', /text-overflow:\s*ellipsis/, 'eine Zeile mit Ellipse');
   const agenda = cal.find((r) => !r.at.length && r.selector.trim() === '.agenda-tasks .cal-task-chip');
   assert.match(agenda?.body ?? '', /font-size:\s*var\(--type-caption\)/, 'die Aufgabe in der Agenda ist eine Zeile, kein Etikett');
 

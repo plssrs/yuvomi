@@ -742,6 +742,32 @@ test('Vorwahl: in der Spalte ohne Adress-Auswahl steht die erste sichtbare Zeile
   handle.destroy();
 });
 
+/**
+ * R22 (Critique a2/a6 LoAF, D22): DIE VORWAHL FRAGT NUR BIS ZUR ERSTEN
+ * SICHTBAREN ZEILE. `getClientRects()` an einer Zeile in einer aufgeschobenen
+ * Gruppe (`content-visibility: auto`) zwingt deren Layout nach; die Vorwahl
+ * fragte beim Aufbau JEDE Zeile und hob die Regel am Desktop auf (261
+ * Aufgaben: 162 ms erzwungenes Layout bei 4x CPU, im Frame des Wechsels).
+ */
+test('R22 D22: die Vorwahl misst nur bis zur ersten sichtbaren Zeile', async () => {
+  const p = makePage();
+  p.rows[0].hidden = true;
+  const asked = [];
+  for (const row of p.rows) {
+    const own = row.getClientRects.bind(row);
+    row.getClientRects = () => { asked.push(row.getAttribute('data-md-id')); return own(); };
+  }
+  const handle = md.mountMasterDetail({
+    root: p.root,
+    renderDetail: (id, into) => { p.calls.render.push(id); into.content = [`detail:${id}`]; },
+    openNarrow: (id) => p.calls.narrow.push(id),
+  });
+  await tick();
+  assert.equal(handle.selectedId(), '2', 'die erste SICHTBARE Zeile ist gewaehlt');
+  assert.deepEqual(asked.filter((id) => id > '2'), [], `Zeilen nach der ersten sichtbaren gemessen: ${asked.join(',')}`);
+  handle.destroy();
+});
+
 test('Vorwahl: nie unter der Schwelle, nie gegen ?open=, nie mit preselect:false', () => {
   let p = makePage({ split: false });
   let handle = p.mount({ preselect: true });
@@ -915,9 +941,13 @@ test('Schwelle: ein 1280er-Laptop bekommt Liste + Detail, auch mit klassischer B
   assert.ok(threshold <= surface1280,
     `Schwelle ${threshold}px > Modulflaeche ${surface1280}px bei 1280 - der Laptop bekommt kein Liste + Detail`);
   // Und nach unten begrenzt: Liste + Luecke + ein lesbares Detail muessen passen.
+  // R23 (D13): die Liste hat mindestens 480px - mit 420 blieben dem
+  // Aufgabentitel bei 1280 194px (Critique G2). Das Detail traegt dafuer an
+  // der Schwelle selbst 472px, bei 1280 gemessen 492px.
   const listMin = px('--layout-list-min', 'rem');
-  assert.ok(threshold - listMin - 24 - 2 * 32 >= 480,
-    `Schwelle ${threshold}px laesst dem Detail unter 480px - zu schmal zum Lesen`);
+  assert.ok(listMin >= 480, `Listenbahn ${listMin}px < 480px - die Titel brechen bei 1280 wieder um`);
+  assert.ok(threshold - listMin - 24 - 2 * 32 >= 460,
+    `Schwelle ${threshold}px laesst dem Detail unter 460px - zu schmal zum Lesen`);
 });
 
 test('Detailfuss: klebt unten in der Spalte, einreihig, und steht bei kurzem Inhalt an der Unterkante (L6)', () => {
@@ -1244,4 +1274,111 @@ test('die ausgewaehlte Zeile der Spaltenform traegt den Modulton, nicht den Akze
   const chip = [...eachRule(readFileSync(new URL('../public/styles/filter-chip.css', import.meta.url), 'utf8'))]
     .find((r) => r.selector.trim() === '.filter-chip--active' && !r.at.length);
   assert.match(chip.body, /var\(--module-accent/, 'der aktive Filter-Chip spricht ebenfalls im Modulton');
+});
+
+/* `?open=` GEHT MIT DEM BLATT (Critique R22, D2, a6 P2). Unter der Schwelle
+ * nennt die Adresse das offene Blatt; nach dem Schliessen blieb sie stehen
+ * (gemessen mobil: Aufgaben, Kontakte, Rezepte, Kalender), und ein Neuladen
+ * oeffnete es wieder. Das Blatt hier ist ein echtes Overlay im Register
+ * (overlay-history), die History eine kleine Attrappe mit Stapel, damit der
+ * Marker des Blatts wirklich zurueckgegeben wird. */
+test('unter der Schwelle nimmt das Schliessen des Blatts `?open=` per replaceState weg', async () => {
+  const ov = await import('../public/utils/overlay-history.js');
+  const original = { ...global.history };
+  const stack = [];
+  Object.assign(global.history, {
+    pushState(state, _t, path) { stack.push(location.href); historyLog.push(['push', path]); this.state = state; setUrl(path); },
+    back() {
+      historyLog.push(['back']);
+      setTimeout(() => { setUrl(stack.pop()); ov.handleBackNavigation(); }, 0);
+    },
+  });
+  try {
+    const p = makePage({ path: '/contacts?open=2', split: false });
+    const handle = p.mount({ deepLinkNarrow: true });
+    assert.deepEqual(p.calls.narrow, ['2'], 'der Deep-Link oeffnet schmal sein Blatt');
+    const sheet = ov.pushOverlay(() => {});
+    await tick();
+    const edit = ov.pushOverlay(() => {});
+    await tick();
+    ov.dropOverlay(edit);
+    await tick(); await tick();
+    assert.equal(location.search, '?open=2', 'ein Dialog UEBER dem Blatt nimmt die Adresse nicht mit');
+    historyLog.length = 0;
+    ov.dropOverlay(sheet);
+    await tick(); await tick(); await tick();
+    assert.equal(location.search, '', 'das Blatt ist zu - die Adresse nennt es nicht mehr');
+    assert.deepEqual(historyLog.filter(([kind]) => kind !== 'back'), [['replace', '/contacts']],
+      'ersetzt, kein neuer Schritt fuer die Zurueck-Taste');
+    assert.equal(handle.selectedId(), null, 'und keine gemerkte Auswahl, die beim Verbreitern aufginge');
+    handle.destroy();
+
+    // In der Spalte ist die Adresse die Auswahl: ein Dialog darueber geht zu, sie bleibt.
+    const q = makePage({ path: '/contacts?open=3', split: true });
+    const h2 = q.mount();
+    const dialog = ov.pushOverlay(() => {});
+    await tick();
+    ov.dropOverlay(dialog);
+    await tick(); await tick(); await tick();
+    assert.equal(location.search, '?open=3', 'die Spalte behaelt ihre Auswahl');
+    h2.destroy();
+
+    // Eine Seite, die ihren Link selbst einloest (Kalender, Rezepte).
+    setUrl('/calendar?open=7&date=2026-10-23');
+    md.releaseAddressOnClose('open', '7');
+    const popover = ov.pushOverlay(() => {});
+    await tick();
+    ov.dropOverlay(popover);
+    await tick(); await tick(); await tick();
+    assert.equal(location.pathname + location.search, '/calendar?date=2026-10-23',
+      'nur `open` geht, der Tag bleibt');
+  } finally {
+    Object.assign(global.history, original);
+  }
+});
+
+// R22-F (F1 Punkt 5): `isSplit()` loeste beim Aufbau die Container-Abfrage auf
+// und erzwang mitten im Kalenderaufbau ein Layout (Agenda 390px, 4x CPU: 9 ms) -
+// am Telefon, wo die Spalte nie steht. `splitMedia` nennt die Fensterbreite,
+// unter der sie sicher fehlt (die Flaeche ist nie breiter als das Fenster).
+test('R22-F: unter splitMedia fragt der Baustein die Box nicht ab', () => {
+  const p = makePage({ split: true });
+  const savedGcs = globalThis.getComputedStyle;
+  const savedMm = globalThis.window.matchMedia;
+  let reads = 0;
+  globalThis.getComputedStyle = (el) => { reads += 1; return savedGcs(el); };
+  try {
+    globalThis.window.matchMedia = () => ({ matches: false });
+    const narrow = p.mount({ splitMedia: '(min-width: 65rem)' });
+    reads = 0;
+    assert.equal(narrow.isSplit(), false, 'unter der Fensterbreite keine Spalte');
+    assert.equal(reads, 0, 'ohne getComputedStyle');
+    narrow.destroy();
+    globalThis.window.matchMedia = () => ({ matches: true });
+    const wide = p.mount({ splitMedia: '(min-width: 65rem)' });
+    assert.equal(wide.isSplit(), true, 'breit entscheidet weiter die Box');
+    wide.destroy();
+  } finally {
+    globalThis.getComputedStyle = savedGcs;
+    globalThis.window.matchMedia = savedMm;
+  }
+  const cal = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
+  const agenda = cal.slice(cal.indexOf('function mountAgendaDetail('), cal.indexOf('function mountAgendaDetail(') + 1200);
+  assert.match(agenda, /splitMedia: '\(min-width: 65rem\)'/, 'die Agenda nennt die Schwelle von module-surface (layout.css)');
+});
+
+// R23 S11 (Critique G2 P3): zeigt die Liste ihren Leerzustand, bat die Spalte
+// daneben trotzdem "Waehle eine Aufgabe". Dann tritt die leere Karte ab.
+test('R23: ohne etwas zu waehlen steht keine Aufforderung in der Spalte', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const css = readFileSync(new URL('../public/styles/layout.css', import.meta.url), 'utf8');
+  const rule = [...eachRule(css)].find((r) => r.selector.replace(/\s+/g, ' ').trim()
+    === '.split-view:has(> .split-view__list .empty-state) > .split-view__detail:has(> .split-view__empty:not([hidden]))');
+  assert.ok(rule, 'die Regel fehlt');
+  assert.match(rule.body, /visibility:\s*hidden/, 'die Karte haelt ihren Platz, zeigt aber nichts');
+  assert.ok(rule.at.some((at) => /@container module-surface \(min-width: 65rem\)/.test(at)), 'nur in der Spaltenform');
+  // Die Klasse des Leerzustands der Spalte selbst darf die Regel nicht ausloesen:
+  // sie steht in der Detailspalte, nicht in der Liste.
+  const md = readFileSync(new URL('../public/utils/master-detail.js', import.meta.url), 'utf8');
+  assert.match(md, /<div class="split-view__empty" data-md-empty>/);
 });

@@ -5,8 +5,9 @@
  */
 
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal, selectModal, advancedSection, promptModal, confirmModal, refocusAfterRender, renderKeepingFocus, captureModalContext, captureOpenContext, isModalContextCurrent, reportFieldError, reportFieldErrors, constraintErrors } from '/components/modal.js';
-import { t, formatDate, getLocale } from '/i18n.js';
+import { openModal as openSharedModal, closeModal, selectModal, advancedSection, promptModal, confirmModal, refocusAfterRender, renderKeepingFocus, captureModalContext, captureOpenContext, isModalContextCurrent, reportFieldError, reportFieldErrors, constraintErrors, lastInputWasKeyboard } from '/components/modal.js';
+import { t, getLocale } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { stagger, wireScrollFade, scheduleUndoableDelete } from '/utils/ux.js';
 import { redrawList, collapseRow } from '/utils/list-motion.js';
@@ -255,13 +256,13 @@ let state = {
   currentUserId: null,
   dmsAccounts: [],
   activeUploadBackend: 'local',
-  // Mobil ist die kompakte LISTE der Default: die Grid-Karte kostet bei 375px
-  // ~260px je Dokument (~1,5 Dokumente je Schirm), die Listenzeile traegt
-  // dieselben Angaben auf einem Bruchteil (Critique 2026-08-27, P2). Die
-  // gespeicherte Wahl gewinnt auf jedem Geraet; 640px ist die kanonische
-  // Mobile-Grenze (tokens.css §11c).
-  view: localStorage.getItem('yuvomi-documents-view')
-    || (typeof matchMedia !== 'undefined' && matchMedia('(max-width: 639px)').matches ? 'list' : 'grid'),
+  // DIE LISTE IST DER DEFAULT, AUCH AM DESKTOP (R22, D11). Mobil seit der
+  // Critique 2026-08-27 (P2: die Grid-Karte kostete bei 375px ~260px je
+  // Dokument). Am Desktop zeigte das Raster bei 1280px rund fuenf Dokumente
+  // mit 190px-Vorschauen leerer A4-Blaetter (Critique a4) - die Liste traegt
+  // Typ-Zeichen, Datum und Groesse in einer Zeile. Das Raster bleibt waehlbar,
+  // und die gespeicherte Wahl gewinnt auf jedem Geraet.
+  view: localStorage.getItem('yuvomi-documents-view') || 'list',
   sort: readStoredSort(),
   sortDirection: readStoredSortDirection(readStoredSort()),
   status: 'active',
@@ -490,8 +491,11 @@ export async function render(container, context = {}) {
           <div id="documents-list" class="${listClasses()}" aria-busy="true">${renderSkeletonList({ rows: 6, lines: 2 })}</div>
         </div>
       </div>
+      ${/* "+" WIE JEDER ANLEGEN-KNOPF (R22, D11): der Pfeil nach oben war der
+           einzige FAB ohne Plus - das Nomen "Dokument" sagt, was entsteht;
+           das Hochladen sagt der Dialog. */ ''}
       <button class="page-fab" id="fab-new-document" aria-label="${t('documents.addButton')}" data-dock-label="${t('newLabel.documents')}">
-        <i data-lucide="upload" class="icon-xl" aria-hidden="true"></i>
+        <i data-lucide="plus" class="icon-xl" aria-hidden="true"></i>
       </button>
     </div>
   `);
@@ -1181,6 +1185,23 @@ function emptyStateFor() {
       ],
     };
   }
+  // EIN LEERER ORDNER IST KEIN FILTER OHNE TREFFER (R23 S10, Critique G4 P2).
+  // Wer einen frisch angelegten Ordner oeffnet, sah „Keine Dokumente in dieser
+  // Auswahl" mit „Filter zuruecksetzen" als Primaerknopf - als haette er etwas
+  // falsch eingestellt. Ein Ordner allein (ohne Kategorie, ohne „Laeuft bald
+  // ab") ist ein Ort: er ist leer, und der Weg ist das Hochladen hierher
+  // (openDocumentModal waehlt den offenen Ordner vor). Sekundaer, denn der
+  // FAB daneben ist die Primaeraktion (Komponenten-Kanon D5).
+  const folderOnly = Number(state.folderId) > 0 && !state.category && !state.expiringSoon;
+  if (folderOnly) {
+    const folder = state.folders.find((f) => Number(f.id) === Number(state.folderId));
+    return {
+      variant: 'empty',
+      icon: 'folder-open',
+      title: folder ? t('documents.emptyFolderTitle', { name: folder.name }) : t('documents.emptyFilterTitle'),
+      actions: readOnly() ? [] : [{ id: 'documents-empty-upload', label: t('documents.emptyPrimary'), icon: 'upload', variant: 'secondary' }],
+    };
+  }
   if (hasActiveFilter()) {
     return {
       variant: 'no-results',
@@ -1188,7 +1209,7 @@ function emptyStateFor() {
       title: t('documents.emptyFilterTitle'),
       description: t('documents.emptyFilterDescription'),
       actions: [
-        { id: 'documents-empty-reset', label: t('documents.resetFiltersAction'), icon: 'filter-x', variant: 'primary' },
+        { id: 'documents-empty-reset', label: t('documents.resetFiltersAction'), icon: 'filter-x', variant: 'secondary' },
         ...(readOnly() ? [] : [{ id: 'documents-empty-upload', label: t('documents.emptyPrimary'), icon: 'upload', variant: 'secondary' }]),
       ],
     };
@@ -1200,7 +1221,7 @@ function emptyStateFor() {
       title: t('documents.emptyArchivedTitle'),
       description: t('documents.emptyArchivedDescription'),
       actions: [
-        { id: 'documents-empty-active', label: t('documents.showActiveAction'), icon: 'corner-up-left', variant: 'primary' },
+        { id: 'documents-empty-active', label: t('documents.showActiveAction'), icon: 'corner-up-left', variant: 'secondary' },
       ],
     };
   }
@@ -1215,8 +1236,9 @@ function emptyStateFor() {
     icon: 'folder-open',
     title: t('documents.emptyTitle'),
     description: t('documents.emptyDescription'),
+    // Beide sekundaer: der FAB ist der Primaerweg (Kanon D5, R23 D14-Guard).
     actions: [
-      { id: 'documents-empty-upload', label: t('documents.emptyPrimary'), icon: 'upload', variant: 'primary' },
+      { id: 'documents-empty-upload', label: t('documents.emptyPrimary'), icon: 'upload', variant: 'secondary' },
       { id: 'documents-empty-folder', label: t('documents.emptySecondary'), icon: 'folder-plus', variant: 'secondary' },
     ],
   };
@@ -1978,7 +2000,7 @@ async function handleFolderDeleteError(err, folder, { delayed = false, owner = n
 
 // `showSize` aus, wenn die Ansicht die Größe bereits in einer eigenen Spalte
 // führt (Listenzeile) — sonst stünde sie doppelt in derselben Zeile.
-function renderMeta(doc, { showSize = true } = {}) {
+function renderMeta(doc, { showSize = true, stats = '' } = {}) {
   const labels = categoryLabels();
   const categoryLabel = labels[doc.category] || doc.category;
   // Der Ordner-Chip entfaellt, wenn der Ordner die Kategorie wiederholt, und im
@@ -1992,6 +2014,7 @@ function renderMeta(doc, { showSize = true } = {}) {
   // letztere nur, wenn sie vom Standard abweicht (showsVisibility).
   return `
     ${expiryChipHtml(doc)}
+    ${stats}
     <span><i data-lucide="${CATEGORY_ICONS[doc.category] || 'folder'}" aria-hidden="true"></i>${categoryLabel}</span>
     ${folderChip ? `<span><i data-lucide="folder" aria-hidden="true"></i>${esc(doc.folder_name)}</span>` : ''}
     ${hidesPrivacyControls('documents') || !showsVisibility(doc.visibility) ? '' : `<span><i data-lucide="${doc.visibility === 'private' ? 'lock' : 'user-check'}" aria-hidden="true"></i>${t(`documents.visibility.${doc.visibility}`)}</span>`}
@@ -2167,14 +2190,14 @@ function expiryChipHtml(doc) {
  * Ablaufdatum in der Viewer-Meta - immer, wenn eines gesetzt ist, auch weit in
  * der Zukunft ("Gueltig bis 13.04.2027"). Die Zeile schweigt bei "gueltig";
  * ohne diese Angabe war das eingetragene Datum nach dem Speichern nur im
- * Bearbeiten-Dialog wiederzufinden. formatDate() liest den Tagesschluessel als
- * Wanduhrzeit (utils/timezone.js#zonedFields) - kein Umweg ueber einen
- * Zeitpunkt, der je nach Zone auf den Vortag kippt.
+ * Bearbeiten-Dialog wiederzufinden. dateText() liest den Tagesschluessel als
+ * Schluessel (utils/date-format.js) - kein Umweg ueber einen Zeitpunkt, der je
+ * nach Zone auf den Vortag kippt; das Jahr steht nur ausserhalb des laufenden.
  */
 function expiryViewerHtml(doc) {
   const spec = expiryViewerSpec(dateStatus(doc.expires_at));
   if (!spec) return '';
-  const text = esc(t(spec.key, { date: formatDate(spec.dateKey) }));
+  const text = esc(t(spec.key, { date: dateText(spec.dateKey) }));
   const icon = '<i data-lucide="calendar-clock" aria-hidden="true"></i>';
   return spec.tone
     ? `<span class="doc-badge doc-badge--${spec.tone}">${icon}${text}</span>`
@@ -2285,7 +2308,7 @@ function renderGridCard(doc) {
         <div class="document-card__meta">${renderMeta(doc)}</div>
       </div>
       <div class="document-card__foot">
-        <span class="document-card__date">${formatDate(doc.updated_at)}</span>
+        <span class="document-card__date">${dateText(doc.updated_at)}</span>
         ${state.selectMode ? renderSelectBox(doc) : `<div class="document-card__actions" role="toolbar" aria-label="${esc(t('documents.actionsFor', { name: doc.name }))}"${readBarAttr(doc)}>${renderActions(doc)}</div>`}
       </div>
     </article>
@@ -2302,10 +2325,17 @@ function renderListItem(doc) {
       ${state.selectMode && mayManage(doc) ? renderSelectBox(doc) : renderRowGlyph(doc)}
       <div class="list-row__main document-row__body">
         <h2 class="list-row__name document-row__title">${esc(doc.name)}</h2>
-        <div class="list-row__meta document-row__meta">${renderMeta(doc, { showSize: false })}</div>
+        ${/* DATUM UND GROESSE AUCH SCHMAL (R22, D11): unter 30rem faellt die
+             Spalte rechts (documents.css), und die Zeile trug nur noch
+             Kategorie und Ordner. Dieselben zwei Angaben stehen dann in der
+             Metazeile hinter dem Ablauf und VOR der Kategorie: die nennt das
+             Zeichen am Zeilenanfang schon, sie darf als Erste weichen (bei
+             "Versicherung" fiel sonst das Datum aus der Zeile). Breit ist
+             diese Fassung aus dem Baum. */ ''}
+        <div class="list-row__meta document-row__meta">${renderMeta(doc, { showSize: false, stats: `<span class="document-row__meta-stats">${dateText(doc.updated_at)} · ${formatFileSize(doc.file_size)}</span>` })}</div>
       </div>
       <div class="document-row__stats">
-        <span class="document-row__date">${formatDate(doc.updated_at)}</span>
+        <span class="document-row__date">${dateText(doc.updated_at)}</span>
         <span class="document-row__size">${formatFileSize(doc.file_size)}</span>
       </div>
       ${state.selectMode ? '' : `<div class="document-row__actions" role="toolbar" aria-label="${esc(t('documents.actionsFor', { name: doc.name }))}"${readBarAttr(doc)}>${renderActions(doc)}</div>`}
@@ -2755,13 +2785,17 @@ function openDocumentModal(doc = null) {
             <p class="document-form__hint" id="document-size-hint">${t('documents.fileHint', { size: effectiveUploadMb() })}</p>
             <button type="button" class="document-folder-link" id="document-folder-choice" hidden>${t('documents.folderUpload.chooseFolder')}</button>
           </div>
-          <p class="document-storage-target">
+          ${/* DER SPEICHERORT IST EINE AUSKUNFT FUER ADMINS (R22, D11). "Neue
+               Dateien werden gespeichert in: Lokal" stand fuer jedes Mitglied
+               im Dialog - eine Angabe, an der niemand ausser dem Admin etwas
+               aendern kann (Critique a4); fuer ihn fuehrt sie zur Einstellung. */ ''}
+          ${state.isAdmin ? `<p class="document-storage-target">
             <i data-lucide="${uploadTargetIcon(state.activeUploadBackend)}" aria-hidden="true"></i>
             <span>${t('documents.activeUploadTarget', {
               target: uploadBackendLabel(state.activeUploadBackend),
             })}</span>
-            ${state.isAdmin ? `<a class="document-storage-target__link" href="/settings/modules/documents?section=documents-storage" data-nav>${t('documents.storageSettingsLink')}</a>` : ''}
-          </p>
+            <a class="document-storage-target__link" href="/settings/modules/documents?section=documents-storage" data-nav>${t('documents.storageSettingsLink')}</a>
+          </p>` : ''}
           <section class="folder-upload-preview" id="document-folder-upload-preview" aria-live="polite" hidden></section>
         </div>`;
 
@@ -2850,6 +2884,16 @@ function bindDropzone(panel) {
         : '';
     const group = nameField?.closest('.form-group');
     if (group) group.hidden = files.length > 1;
+    // DIE GROESSE GLEICH BEI DER WAHL (R23 S10, Critique G4 P3 "Groessenpruefung
+    // vorab"). Zu gross meldete sich erst beim Absenden - nachdem Name,
+    // Kategorie und Ordner ausgefuellt waren. Jetzt an der Ablage, sobald die
+    // Datei gewaehlt oder abgelegt ist; das Absenden prueft weiter (saveDocument).
+    // Nach dem laufenden `change`: der Fehler raeumt sich beim naechsten
+    // `change` an der Ablage selbst ab und darf dieses nicht mitzaehlen.
+    const maxSize = state.maxFileSize || maxUploadBytes();
+    const tooBig = files.find((file) => file.size > maxSize);
+    const form = input.closest('form');
+    if (tooBig && form) setTimeout(() => reportDropzoneError(form, t('documents.fileTooLargeNamed', { name: tooBig.name })), 0);
   };
 
   input.addEventListener('change', syncSelectedFile);
@@ -4061,12 +4105,12 @@ function openDocumentViewer(doc, { opener: listOpener = null } = {}) {
   // der Liste, den der vorige Betrachter weiterreicht (Codex zu #2142).
   const trigger = document.activeElement;
   const opener = listOpener ?? trigger;
-  // Per Tastatur geoeffnet? Der Browser weiss es: er zeigt den Fokusring am
-  // Ausloeser nur dann. Ein alter Browser ohne den Selektor wirft - dann gilt
-  // "nein", und der Fokus-Waechter des PDFs nimmt nichts zurueck. Beim
+  // Per Tastatur geoeffnet? Die letzte Eingabe sagt es (modal.js,
+  // lastInputWasKeyboard) - derselbe Zeuge wie der Erstfokus der Dialoge. Der
+  // `:focus-visible` des Ausloesers taugte nicht: nach einem Seitenwechsel
+  // traegt ihn die Seitenwurzel auch nach einem Mausklick (R23 S6/S11). Beim
   // Blaettern zaehlt der Knopf oder die Taste des Schritts, nicht die Liste.
-  let openedByKeyboard = false;
-  try { openedByKeyboard = trigger?.matches?.(':focus-visible') === true; } catch { /* Selektor unbekannt */ }
+  const openedByKeyboard = lastInputWasKeyboard();
 
   // VOR UND ZURUECK IM BETRACHTER (Critique R21, Persona Alex): wer zehn
   // Belege durchsieht, musste je Dokument schliessen und das naechste oeffnen.
@@ -4110,12 +4154,19 @@ function openDocumentViewer(doc, { opener: listOpener = null } = {}) {
           ${doc.folder_name && !folderRepeatsCategory(doc.folder_name, categoryLabel) ? `<span><i data-lucide="folder" aria-hidden="true"></i>${esc(doc.folder_name)}</span>` : ''}
           <span>${formatFileSize(doc.file_size)}</span>
           ${expiryViewerHtml(doc)}
+          ${/* DAS PAAR STEHT ALS PAAR (R22, D11). Am Rand der Liste hielt eine
+                leere Luecke die Stelle des fehlenden Pfeils; mobil brach die
+                Leiste unter den Kategorie-Knopf, und dort stand "  >" allein
+                am Zeilenanfang - ein Pfeil ohne Gegenueber. Jetzt zeigt der
+                fehlende Pfeil sich gedimmt (Zeichen, kein Knopf), und das Paar
+                steht mobil in der Zeile der Kategorie, die Handlungen darunter.
+                Am Desktop bleibt es vor den Handlungen (documents.css). */ ''}
+          ${prevDoc || nextDoc ? `
+          <span class="document-viewer__pager">
+            ${prevDoc ? rowActionHtml({ icon: 'chevron-left', action: 'viewer-prev', label: t('documents.viewerPrevNamed', { name: prevDoc.name }), attrs: { 'aria-keyshortcuts': stepKeys.prev, title: t('documents.viewerPrevNamed', { name: prevDoc.name }) } }) : '<span class="row-action document-viewer__pager-edge" aria-hidden="true"><i data-lucide="chevron-left" class="icon-md"></i></span>'}
+            ${nextDoc ? rowActionHtml({ icon: 'chevron-right', action: 'viewer-next', label: t('documents.viewerNextNamed', { name: nextDoc.name }), attrs: { 'aria-keyshortcuts': stepKeys.next, title: t('documents.viewerNextNamed', { name: nextDoc.name }) } }) : '<span class="row-action document-viewer__pager-edge" aria-hidden="true"><i data-lucide="chevron-right" class="icon-md"></i></span>'}
+          </span>` : ''}
           <span class="document-viewer__actions">
-            ${prevDoc || nextDoc ? `
-            <span class="document-viewer__pager">
-              ${prevDoc ? rowActionHtml({ icon: 'chevron-left', action: 'viewer-prev', label: t('documents.viewerPrevNamed', { name: prevDoc.name }), attrs: { 'aria-keyshortcuts': stepKeys.prev, title: t('documents.viewerPrevNamed', { name: prevDoc.name }) } }) : '<span class="document-viewer__pager-gap" aria-hidden="true"></span>'}
-              ${nextDoc ? rowActionHtml({ icon: 'chevron-right', action: 'viewer-next', label: t('documents.viewerNextNamed', { name: nextDoc.name }), attrs: { 'aria-keyshortcuts': stepKeys.next, title: t('documents.viewerNextNamed', { name: nextDoc.name }) } }) : '<span class="document-viewer__pager-gap" aria-hidden="true"></span>'}
-            </span>` : ''}
             ${externalUrl ? `
             <a class="btn btn--ghost btn--sm doc-viewer__dms-link" href="${esc(externalUrl)}" target="_blank" rel="noopener noreferrer">
               <i data-lucide="external-link" class="icon-md" aria-hidden="true"></i>

@@ -4,12 +4,13 @@
  */
 
 import { api } from '/api.js';
-import { t, formatDate, formatDateInput, parseDateInput, isDateInputValid } from '/i18n.js';
+import { t, formatDateInput, parseDateInput, isDateInputValid } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { esc, REQUIRED_MARK, externalHref } from '/utils/html.js';
 import { openModal as openSharedModal, closeModal as closeSharedModal, advancedSection, wireBlurValidation, reportFieldError, refocusAfterRender, captureModalContext, captureOpenContext, isModalContextCurrent, isOwnModalOpen } from '/components/modal.js';
 import { DEFAULT_CATEGORY_NAME, categoryLabel } from '/utils/shopping-categories.js';
 import { renderKitchenTabsBar } from '/utils/kitchen-tabs.js';
-import { resolveShoppingTarget, announceTransfer, mayTransferRecipeToShopping } from '/utils/kitchen-transfer.js';
+import { resolveShoppingTarget, announceTransfer, transferMessage, mayTransferRecipeToShopping } from '/utils/kitchen-transfer.js';
 import { popoverMenuHtml, installPopoverMenus } from '/utils/popover-menu.js';
 import { ingredientRowHTML } from '/utils/ingredient-row.js';
 import { scheduleUndoableDelete } from '/utils/ux.js';
@@ -23,7 +24,7 @@ import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
 import { mealTypeList, ensureMealTypeNames } from '/utils/meal-types.js';
 import { recipeThumbEl, recipeHeroEl } from '/utils/recipe-thumb.js';
 import { navModuleAccess } from '/permissions.js';
-import { mountMasterDetail, splitViewDetailHtml, detailPaneHeaderEl } from '/utils/master-detail.js';
+import { mountMasterDetail, splitViewDetailHtml, detailPaneHeaderEl, releaseAddressOnClose } from '/utils/master-detail.js';
 import { openDetailView, closeDetailView, detailFooterEl, withPrimaryEdit } from '/components/detail-view.js';
 import { mayWritePath } from '/utils/module-access.js';
 import { errorSentence, isGone, isAlreadyDeleted } from '/utils/friendly-error.js';
@@ -368,7 +369,11 @@ function openRecipeFromQuery() {
   if (_md?.isSplit()) return;
 
   const recipe = state.recipes.find((r) => r.id === id);
-  if (recipe && row.querySelector('[data-action="open-detail"]')) openRecipeSheet(recipe);
+  if (recipe && row.querySelector('[data-action="open-detail"]')) {
+    openRecipeSheet(recipe);
+    // Das Leseblatt schliesst - `?open=` geht mit ihm (R22, D2).
+    releaseAddressOnClose('open', raw);
+  }
 }
 
 /**
@@ -478,6 +483,7 @@ export async function render(container, { signal } = {}) {
 
   const list = document.createElement('div');
   list.className = 'list-scroller page-scrollport recipes-list split-view__list';
+  list.dataset.scrollPort = 'recipes';
   list.id = 'recipes-list';
   // Lade-Skeleton bis loadRecipes() aufgelöst ist (Router blendet den Wrapper
   // bereits vor dem Daten-await ein).
@@ -1210,7 +1216,7 @@ function fillRecipeDetail(detail, recipe) {
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
     link.insertAdjacentHTML('beforeend',
-      '<i data-lucide="external-link" class="icon-sm" aria-hidden="true"></i>');
+      '<i data-lucide="external-link" class="icon-md" aria-hidden="true"></i>');
     const linkLabel = document.createElement('span');
     linkLabel.textContent = t('recipes.openLink');
     link.appendChild(linkLabel);
@@ -1392,7 +1398,7 @@ function pantryMatchBulkEl(recipe) {
   btn.className = 'btn btn--ghost recipe-detail__match-open';
   btn.dataset.action = 'match-ingredients';
   btn.dataset.id = String(recipe.id);
-  btn.insertAdjacentHTML('beforeend', '<i data-lucide="link" class="icon-sm" aria-hidden="true"></i>');
+  btn.insertAdjacentHTML('beforeend', '<i data-lucide="link" class="icon-md" aria-hidden="true"></i>');
   const label = document.createElement('span');
   label.textContent = t('recipes.ingredientMatchOpen', { count: open.length });
   btn.appendChild(label);
@@ -1403,7 +1409,7 @@ function pantryMatchBulkEl(recipe) {
 function pantryOptionLabel(item) {
   const teile = [item.name];
   if (item.location_name) teile.push(item.location_name);
-  if (item.expires_on) teile.push(formatDate(item.expires_on));
+  if (item.expires_on) teile.push(dateText(item.expires_on));
   return teile.join(' · ');
 }
 
@@ -1678,7 +1684,7 @@ function recipeModalFooterHtml(isEdit, recipe) {
   const canDelete = isEdit && recipe?.source === 'native';
   return `
       <div class="modal-panel__footer modal-panel__footer--plain">
-        ${canDelete ? `<button type="button" class="btn btn--danger-outline" id="recipe-delete" style="margin-inline-end:auto"><i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}</button>` : ''}
+        ${canDelete ? `<button type="button" class="btn btn--danger-outline" id="recipe-delete"><i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${esc(t('common.delete'))}</button>` : ''}
         <button class="btn btn--secondary" id="recipe-cancel">${t('common.cancel')}</button>
         <button class="btn btn--primary" id="recipe-save">${isEdit ? t('common.save') : t('common.add')}</button>
       </div>`;
@@ -2025,7 +2031,7 @@ async function planRecipe(recipe, btn) {
           await api.post('/meals', mealPayloadFromRecipe(recipe, date, mealType));
           closeSharedModal({ force: true, context: dialog });
           window.yuvomi?.showToast(
-            t('recipes.planSuccess', { name: recipe.title, date: formatDate(date) }),
+            t('recipes.planSuccess', { name: recipe.title, date: dateText(date, { weekday: true }) }),
             'success',
           );
         } catch (err) {
@@ -2083,12 +2089,15 @@ async function transferRecipe(recipe, btn) {
       // Rücknahme über den geteilten Baustein: dieser Pfad überträgt am meisten
       // auf einmal - eine ganze Zutatenliste - in eine Liste, die der Nutzer
       // gerade nicht ansieht (Audit 2026-07-30, P1-B).
+      //
+      // Was schon darauf stand, nennt der Satz mit (R23, D2): vorher sagte er
+      // "3 Zutaten übernommen" und verschwieg die zwei, die er übersprungen hat.
       announceTransfer({
-        message: t('recipes.toShoppingSuccess', { count: added, list: target.name }),
+        message: transferMessage('recipes.toShoppingSuccess', { added, skipped, list: target.name }),
         addedIds: res.data?.added_ids ?? [],
       });
     } else if (skipped > 0) {
-      window.yuvomi?.showToast(t('recipes.toShoppingAllPresent'), 'info');
+      window.yuvomi?.showToast(t('kitchen.transferAllPresent'), 'info');
     } else {
       window.yuvomi?.showToast(t('recipes.toShoppingNoIngredients'), 'info');
     }

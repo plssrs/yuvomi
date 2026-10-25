@@ -20,6 +20,9 @@ import {
   settingsSheetSections,
   migrateLegacySettingsTab,
   readStoredSettingsDestination,
+  settingsOverviewShown,
+  withSettingsOverviewMark,
+  markSettingsOverviewEntry,
   resolveSettingsDestination,
   searchSettings,
   settingsOptionUrl,
@@ -224,7 +227,8 @@ test('die Blaetter verteilen sich wie beschlossen auf drei Bereiche, je Modul ei
   // Dazu "Eigenes Modul hinzufuegen" (modules-install): Drittmodule zu
   // installieren ist eine Handlung im Modul-Bereich, kein Modul - deshalb ein
   // Blatt ohne `module`, aber in derselben Domaene.
-  assert.deepEqual(perDomain, { personal: 5, admin: 8, modules: 16 });
+  // R23 D14: die Kalender-Synchronisation ist ein eigenes Blatt (vorher 16).
+  assert.deepEqual(perDomain, { personal: 5, admin: 8, modules: 17 });
   assert.deepEqual(SETTINGS_DOMAINS.map((domain) => domain.id), ['personal', 'admin', 'modules']);
   // Jedes Blatt haengt an einem existierenden Bereich, jeder Abschnitt an
   // einem existierenden Blatt, und kein Blatt ist leer.
@@ -239,8 +243,10 @@ test('die Blaetter verteilen sich wie beschlossen auf drei Bereiche, je Modul ei
     assert.ok(SETTINGS_SCOPES.includes(section.scope), `${section.id}: unbekannte Reichweite "${section.scope}"`);
   }
   assert.equal(new Set(SETTINGS_SECTIONS.map((section) => section.id)).size, SETTINGS_SECTIONS.length);
-  // Je Modul hoechstens EIN Blatt.
-  const modules = SETTINGS_LEAVES.filter((leaf) => leaf.module).map((leaf) => leaf.module);
+  // Je Modul hoechstens EIN Blatt - mit EINER benannten Ausnahme (R23 D14,
+  // Ulas 2026-10-24): die Kalender-Synchronisation (Konten, Anbieter,
+  // Nachtrag) steht neben dem Kalender, das Blatt hatte 12 Karten und 3473px.
+  const modules = SETTINGS_LEAVES.filter((leaf) => leaf.module && leaf.id !== 'module-calendar-sync').map((leaf) => leaf.module);
   assert.equal(new Set(modules).size, modules.length, 'ein Modul hat zwei Blaetter');
   // Die Sammelschublade ist aufgeloest: kein Blatt heisst mehr Modul-Optionen.
   assert.equal(SETTINGS_LEAVES.some((leaf) => leaf.labelKey === 'settings.pageModuleOptions'), false);
@@ -664,8 +670,9 @@ test('Mitglieder erreichen ihre eigenen Termin-Vorgaben', () => {
   assert.deepEqual(settingsSheetSections(sheet, member).map((entry) => entry.id),
     ['personal-calendar', 'personal-calendar-subscriptions', 'personal-feeds', 'feed-birthdays']);
   // Der haushaltweite Teil bleibt adminOnly.
+  // Seit R23 D14 steht die Synchronisation in einem eigenen Blatt.
   assert.deepEqual(settingsSheetSections(sheet, admin).filter((entry) => entry.adminOnly).map((entry) => entry.id),
-    ['modules-calendar', 'sync-calendar']);
+    ['modules-calendar']);
 });
 
 test('Mitglieder erreichen ihr eigenes Zyklus-Opt-out (#760)', () => {
@@ -727,7 +734,7 @@ test('/settings/modules/health ist das Blatt Gesundheit samt Vorsorge-Typregiste
 test('legacy settings tabs migrate to their new destinations', () => {
   assert.equal(migrateLegacySettingsTab('general'), '/settings/personal/appearance');
   assert.equal(migrateLegacySettingsTab('shopping'), '/shopping?manage=categories');
-  assert.equal(migrateLegacySettingsTab('sync'), '/settings/modules/calendar');
+  assert.equal(migrateLegacySettingsTab('sync'), '/settings/modules/calendar-sync');
   assert.equal(migrateLegacySettingsTab('backup'), '/settings/admin/backup');
   // Ein Alt-Tab muss am heutigen Blatt ankommen, nicht an einem Zwischenstand.
   assert.equal(migrateLegacySettingsTab('budget'), '/settings/modules/budget');
@@ -745,7 +752,7 @@ test('legacy settings migration covers every previous tab', () => {
       budget: '/settings/modules/budget',
       shopping: '/shopping?manage=categories',
       calendar: '/settings/modules/calendar',
-      sync: '/settings/modules/calendar',
+      sync: '/settings/modules/calendar-sync',
       account: '/settings/personal/account',
       family: '/settings/admin/family',
       'api-tokens': '/settings/admin/api',
@@ -874,6 +881,43 @@ test('der Settings-Controller rendert ohne gespeichertes Ziel die Uebersicht', a
   assert.match(source, /if \(destination\) \{ await redirectTo\(destination\); return; \}/);
   assert.match(source, /view: known \? 'domain' : 'domains'/);
   assert.doesNotMatch(source, /await redirectTo\(readStoredSettingsDestination/);
+});
+
+/* ZURUECK AUS EINEM BLATT FUEHRT AUF DIE UEBERSICHT (Critique R22, D2, a5 P1).
+ * Uebersicht -> Darstellung -> Zurueck blieb mobil auf dem Blatt: update()
+ * gab fuer ein nacktes `/settings` false zurueck, das volle Rendern stellte das
+ * zuletzt besuchte Blatt wieder her und ersetzte den Eintrag. Jetzt folgt
+ * `/settings` innerhalb der Sektion der Adresse, und ein Eintrag, der die
+ * Uebersicht zeigte, traegt einen Merker im History-State - auch ein Zurueck
+ * von aussen zeigt dort die Uebersicht. Wiederhergestellt wird nur ein frischer
+ * Einstieg. Gemessen im Browser (s1/probes/settings.mjs): vorher C =
+ * /settings/personal/appearance, nachher /settings mit Liste. */
+test('Zurueck aus einem Einstellungsblatt fuehrt auf die Uebersicht, nicht zurueck ins Blatt', async () => {
+  const source = await readFile(new URL('../public/pages/settings.js', import.meta.url), 'utf8');
+  const update = source.slice(source.indexOf('export async function update('));
+  const root = update.slice(update.indexOf('if (path === SETTINGS_ROOT) {'), update.indexOf('const leaf = findSettingsLeaf'));
+  assert.match(root, /if \(hasOAuthResult\) return false;/, 'nur das OAuth-Ergebnis braucht den vollen Weg');
+  assert.doesNotMatch(root, /!OVERVIEW_VIEWS\.has\(view\)\) return false/,
+    'ein nacktes /settings innerhalb der Sektion darf nicht ins volle Rendern samt Wiederherstellung fallen');
+  assert.match(root, /markSettingsOverviewEntry\(\);\s*return true;/, 'die weiche Uebersicht merkt ihren Eintrag');
+  assert.match(source, /const destination = OVERVIEW_VIEWS\.has\(view\) \|\| settingsOverviewShown\(history\.state\)/,
+    'ein Eintrag, der die Uebersicht zeigte, stellt kein Blatt wieder her');
+  assert.match(source, /view: known \? 'domain' : 'domains',[\s\S]{0,120}\}\);\s*markSettingsOverviewEntry\(\);/,
+    'die volle Uebersicht merkt ihren Eintrag');
+  const writes = [];
+  const hist = { state: { path: '/settings', scrollKey: 'k1' }, replaceState(st, title, url) { writes.push([st, url]); this.state = st; } };
+  markSettingsOverviewEntry(hist, { pathname: '/settings' });
+  assert.deepEqual(writes, [[{ path: '/settings', scrollKey: 'k1', settingsOverview: true }, undefined]],
+    'der Merker ergaenzt den State, die Adresse bleibt');
+  markSettingsOverviewEntry(hist, { pathname: '/settings' });
+  markSettingsOverviewEntry({ state: null, replaceState() { writes.push('blatt'); } }, { pathname: '/settings/personal/account' });
+  assert.equal(writes.length, 1, 'einmal je Eintrag, und nie auf einem Blatt (Desktop-Vorwahl)');
+  const marked = withSettingsOverviewMark({ path: '/settings', scrollKey: 'k1' });
+  assert.deepEqual(marked, { path: '/settings', scrollKey: 'k1', settingsOverview: true },
+    'path und scrollKey bleiben stehen');
+  assert.equal(settingsOverviewShown(marked), true);
+  assert.equal(settingsOverviewShown(null), false);
+  assert.equal(settingsOverviewShown({ path: '/settings' }), false);
 });
 
 test('every approved settings leaf is registered as an exact SPA route', async () => {
@@ -1331,7 +1375,7 @@ test('der Blattwechsel zeigt einen Ladezustand statt eines leeren Kastens', asyn
   const body = source.slice(source.indexOf('async function renderLeafContent'), source.indexOf('function isSplit('));
   // Seit 2026-09-28 wartet die Shell hoechstens SECTION_WAIT_MS (A7 P1-2); das
   // Fertig-Stueck `finishLeaf` laeuft trotzdem genau einmal nach ALLEN.
-  assert.match(body, /await awaitSections\(\s*hosts\.map\(\(\[host, section\]\) => renderSheetSection\([^)]*\)\),\s*finishLeaf,\s*\)/,
+  assert.match(body, /await awaitSections\(\s*hosts\.map\(\(\[host, section\]\) => renderSheetSection\([^)]*\)(?:\.finally\(\(\) => reveal\.done\(host\)\))?\),\s*finishLeaf,\s*\)/,
     'die Abschnitte laufen durch awaitSections, das Fertig-Stueck haengt daran');
   assert.match(body, /const finishLeaf = \(\) => \{\s*clearTimeout\(skeletonTimer\);[\s\S]*?leafContainer\.removeAttribute\('aria-busy'\);/,
     'aria-busy muss nach allen Abschnitten entfernt werden, auch wenn einer scheitert');
@@ -1505,6 +1549,17 @@ test('navigation sections match the grouped desktop information architecture', (
 // Kopf - "Finanzen" stand ueber Budget allein. Die Kueche zaehlt als ein
 // Eintrag, die Uebersicht hat nie einen Kopf. Seitenleiste und Mehr-Blatt
 // lesen dieselbe Regel.
+// R22 D14 hatte dem Mehr-Blatt jede Sektion benannt (`standalone`). R23 (D13,
+// Critique G0 S-P2-3): der Kopf "Finanzen" ueber Budget allein schob die Zeile
+// bei 390x844 unter die Falz. Das Blatt liest jetzt dieselbe Regel wie die
+// Seitenleiste, gezaehlt an SEINER Liste.
+test('R23 D13: auch im Mehr-Blatt bekommt eine Sektion erst ab zwei Eintraegen einen Kopf', async () => {
+  const { navSectionLabelKey } = await import('../public/settings/module-order.js');
+  assert.equal(navSectionLabelKey(NAV_SECTION.finance, 1, { standalone: true }), null,
+    'kein Sonderweg mehr: Budget allein steht auch im Blatt ohne "Finanzen"');
+  assert.equal(navSectionLabelKey.length, 2, 'die Regel kennt keine Option mehr');
+});
+
 test('R19: eine Sektion mit nur einem Eintrag hat keinen Namen in der Navigation', async () => {
   const { navSectionLabelKey, navSectionEntryCounts } = await import('../public/settings/module-order.js');
   assert.equal(navSectionLabelKey(NAV_SECTION.finance, 1), null, 'Budget allein: kein "Finanzen"');
@@ -1525,9 +1580,11 @@ test('R19: eine Sektion mit nur einem Eintrag hat keinen Namen in der Navigation
   assert.match(sidebar, /navSectionLabelKey\(section, entryCounts\.get\(section\)\)/, 'die Seitenleiste fragt die Regel');
   assert.doesNotMatch(router, /const NAV_SECTION_LABEL_KEYS = /, 'keine Abschrift der Namen-Tabelle im Router');
   const sheet = router.slice(router.indexOf('function moreSheetSections('), router.indexOf('function buildMoreSheetBody()'));
-  assert.match(sheet, /navSectionLabelKey\(section, labelCounts\.get\(section\)\)/, 'das Mehr-Blatt fragt dieselbe Regel');
+  assert.match(sheet, /navSectionLabelKey\(section, labelCounts\.get\(section\)\)/,
+    'das Mehr-Blatt fragt dieselbe Regel wie die Seitenleiste (R23 D13)');
   const body = router.slice(router.indexOf('function buildMoreSheetBody()'), router.indexOf('function renderPage('));
-  assert.match(body, /navSectionEntryCounts\(navItems\(\)/, 'gezaehlt wird in der Seitenleiste, nicht im Blatt ohne Favoriten');
+  assert.match(body, /const labelCounts = navSectionEntryCounts\(modules\);/,
+    'gezaehlt wird im Blatt selbst: ein Kopf gliedert erst ab zwei Eintraegen DIESER Liste');
 });
 
 test('desktop navigation order is applied only inside each section', () => {
@@ -2872,13 +2929,13 @@ test('S2: der Controller leitet Alt-Adressen samt Abschnitt und Parametern um', 
   // Am Programm statt an der Schreibweise: der Controller fuehrt die Adresse
   // samt Parametern ueber movedSettingsUrl weiter.
   assert.deepEqual((await runSettingsController('/settings/sync/calendar', '?sync_ok=google')).replaced,
-    ['/settings/modules/calendar?section=sync-calendar&sync_ok=google']);
+    ['/settings/modules/calendar-sync?section=sync-calendar&sync_ok=google']);
   // Das OAuth-Ergebnis (?sync_ok) gehoert an den Abschnitt Kalender-Synchronisation.
-  assert.match(source, /const SYNC_CALENDAR_LEAF = '\/settings\/modules\/calendar';/);
+  assert.match(source, /const SYNC_CALENDAR_LEAF = '\/settings\/modules\/calendar-sync';/);
   assert.match(source, /`\$\{SYNC_CALENDAR_LEAF\}\?section=\$\{SYNC_CALENDAR_SECTION\}&\$\{query\.toString\(\)\}`/);
   // Parameter reisen mit, ein alter `?section=` nicht doppelt.
   const { sheet, section, params } = landing('/settings/sync/calendar', 'sync_ok=google&section=alt');
-  assert.equal(sheet.id, 'module-calendar');
+  assert.equal(sheet.id, 'module-calendar-sync');
   assert.equal(section, 'sync-calendar');
   assert.equal(params.get('sync_ok'), 'google');
   assert.equal(params.getAll('section').length, 1);
@@ -3267,7 +3324,8 @@ test('R14: Modulblaetter stehen in der Reihenfolge der Seitenleiste', async () =
   const mods = plain.slice(2, -1);
   // R19 (Ulas 2026-10-16): Planen = Kalender, Aufgaben, Belohnungen, Notizen,
   // Schichtplan. Notizen haben kein eigenes Modulblatt.
-  assert.deepEqual(mods, ['dashboard', 'calendar', 'tasks', 'rewards', 'schedule', 'kitchen', 'housekeeping', 'waste', 'documents',
+  // R23 D14: die Kalender-Synchronisation steht als zweites Blatt des Kalenders direkt dahinter.
+  assert.deepEqual(mods, ['dashboard', 'calendar', 'calendar', 'tasks', 'rewards', 'schedule', 'kitchen', 'housekeeping', 'waste', 'documents',
     'inventory', 'contacts', 'health', 'budget'], 'ohne eigene Anordnung genau wie die Seitenleiste (gemessen 1440)');
   const pos = (id) => mods.indexOf(id);
   assert.equal(mods[0], 'dashboard', 'die Uebersicht fuehrt wie in der Seitenleiste');
@@ -3511,9 +3569,9 @@ test('R16: ein Blatt mit mehr als drei Abschnitten fuehrt Sprungmarken auf seine
 
   const calendar = settingsSheetJumpTargets(sheet('module-calendar'), admin);
   assert.deepEqual(calendar.map((target) => target.id),
-    ['personal-calendar', 'personal-calendar-subscriptions', 'personal-feeds', 'feed-birthdays', 'modules-calendar', 'sync-calendar'],
+    ['personal-calendar', 'personal-calendar-subscriptions', 'personal-feeds', 'feed-birthdays', 'modules-calendar'],
     'in der Reihenfolge des Blatts: erst "Fuer mich", dann der Haushalt');
-  assert.equal(calendar[5].url, '/settings/modules/calendar?section=sync-calendar', 'dasselbe Ziel wie die Umleitungen');
+  assert.equal(calendar[4].url, '/settings/modules/calendar?section=modules-calendar', 'dasselbe Ziel wie die Umleitungen');
   assert.equal(calendar[0].labelKey, 'settings.pageCalendarDefaults', 'die Marke heisst wie der Abschnitt in der Registry');
 
   // Drei Abschnitte sind ein Blick, keine Navigation.
@@ -3870,8 +3928,11 @@ test('R17: die gruppierte Zeile - Label links, Bedienelement rechts, der Hinweis
   const base = rules.find((r) => r.selector.trim() === '.settings-group > .settings-setting-row' && !r.at.length);
   assert.match(base?.body ?? '', /grid-template-columns:\s*minmax\(0, 1fr\) auto/);
   assert.match(base?.body ?? '', /min-height:\s*var\(--target-lg\)/, 'die Zeile ist mobil ein Fingerziel hoch');
+  // R23 S10: die EINE benannte Ausnahme stapelt nur eine Zeile, deren
+  // Bedienelement ein Textfeld ist (Konto mobil 50/50) - nie eine Auswahl.
   const narrowed = rules.filter((r) => r.at.length && /\.settings-group\b[^,{]*\.settings-setting-row\b/.test(r.selector)
-    && /grid-template-columns/.test(r.body));
+    && /grid-template-columns/.test(r.body)
+    && !/:has\(> \.settings-setting-row__control > input\.form-input:only-child:is\(\[type="text"\]/.test(r.selector));
   assert.deepEqual(narrowed.map((r) => r.selector), [],
     'keine Breitenabfrage stapelt die Zeile wieder: gestapelt war ein Auswahlfeld mit "5 Minuten" mobil vollbreit');
   const control = rules.find((r) => r.selector.trim() === '.settings-group .settings-setting-row__control' && !r.at.length);
@@ -4051,8 +4112,10 @@ test('R19: Wand-Modus und Bildschirmschoner stehen im Blatt "Dieses Geraet"', as
   assert.equal(section.sheetId, 'personal-device');
   assert.equal(section.props?.part, 'device');
   for (const key of ['settings.wallModeLabel', 'settings.screensaverIdleLabel', 'settings.screensaverClockLabel', 'settings.screensaverCoverLabel']) {
-    assert.ok(section.options.includes(key), `${key} im Geraete-Abschnitt`);
-    assert.ok(!SETTINGS_SECTIONS.find((s) => s.id === 'personal-appearance').options.includes(key), `${key} nicht mehr unter Darstellung`);
+    // Eine Option ist ein Schluessel oder ein Objekt mit `key` (R23: `synonyms`).
+    const keyOf = (o) => (typeof o === 'string' ? o : o.key);
+    assert.ok(section.options.map(keyOf).includes(key), `${key} im Geraete-Abschnitt`);
+    assert.ok(!SETTINGS_SECTIONS.find((s) => s.id === 'personal-appearance').options.map(keyOf).includes(key), `${key} nicht mehr unter Darstellung`);
   }
   const src = await readFile(new URL('../public/settings/pages/personal-appearance.js', import.meta.url), 'utf8');
   assert.match(src, /if \(container\.dataset\?\.part === 'device'\) \{[\s\S]{0,400}?renderDeviceDisplay\(container, \{ screensaverOn, isAdmin[^}]*\}\);\s*return;/);
@@ -5303,4 +5366,236 @@ test('#2151: Darstellung - Region und Datensprache stehen kurz in der Auswahl, v
   const page = await readFile(new URL('../public/settings/pages/personal-appearance.js', import.meta.url), 'utf8');
   assert.match(page, /regionSelect\?\.addEventListener\('change', async \(\) => \{\s*(?:\/\/[^\n]*\n\s*)*setHint\(container, 'region-hint', regionHintText\(regionSelect\.value\)\);/);
   assert.match(page, /function syncRegionSelect\([\s\S]{0,700}setHint\(container, 'region-hint', regionHintText\(regionSelect\.value\)\);/);
+});
+
+// Critique R22 (D4, a5 P1): die Traeger eines Blatts standen leer und fuellten
+// sich in der Reihenfolge ihrer Daten - jeder fertige Abschnitt schob die
+// darunter weg. Kaltstart gemessen: mobil Mitglieder CLS 0,25, Kalender 0,53,
+// Gesundheit 0,20; Desktop Kalender 0,13, Gesundheit 0,10. Jetzt erscheint ein
+// Abschnitt erst, wenn er fertig ist UND alle darueber stehen; bis dahin liegt
+// er ausserhalb des Flusses, und das Skelett steht an der Kante.
+test('R22 D4: Abschnitte erscheinen ganz und in der Reihenfolge des Blatts - nichts Sichtbares rueckt', async () => {
+  const { __test } = await import('/settings/shell.js');
+  const leafContainer = { dataset: {} };
+  const group = { dataset: { pending: '' }, parentElement: leafContainer };
+  const placed = [];
+  const fake = (parentElement) => ({
+    dataset: { pending: '' },
+    parentElement,
+    insertAdjacentHTML(position, html) {
+      assert.equal(position, 'beforebegin');
+      const node = { html, removed: false, remove() { this.removed = true; } };
+      placed.push(node);
+      this.previousElementSibling = node;
+    },
+  });
+  const [a, b, c] = [fake(leafContainer), fake(group), fake(group)];
+  group.insertAdjacentHTML = a.insertAdjacentHTML;
+  const reveal = __test.revealSectionsInOrder([a, b, c], leafContainer);
+  const pending = () => [a, b, c].map((h) => 'pending' in h.dataset);
+
+  reveal.done(b);
+  assert.deepEqual(pending(), [true, true, true], 'ein Abschnitt unter einem wartenden erschien zuerst - der darueber schoebe ihn spaeter weg');
+  assert.ok('pending' in group.dataset, 'der Reichweitenblock steht vor seinem ersten Traeger');
+  reveal.placeSkeleton();
+  assert.equal(placed.length, 1, 'kein Skelett an der Kante');
+  reveal.done(a);
+  assert.deepEqual(pending(), [false, false, true], 'fertige Abschnitte in Reihenfolge erscheinen gemeinsam');
+  assert.ok(!('pending' in group.dataset), 'der Block erscheint mit seinem ersten Traeger');
+  assert.equal(placed[0].removed, true, 'das alte Skelett rueckte mit, statt zu gehen');
+  assert.equal(placed.length, 2, 'die Kante zum naechsten wartenden Traeger traegt ein NEUES Skelett');
+  reveal.all();
+  assert.deepEqual(pending(), [false, false, false], 'nach dem Ende steht jeder Abschnitt im Fluss');
+  assert.equal(placed[1].removed, true, 'ein Skelett blieb stehen');
+
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const { eachRule } = await import('./css-rules.js');
+  const pendingRule = [...eachRule(css)].find((r) => !r.at.length && /\.settings-sheet-section\[data-pending\]/.test(r.selector));
+  assert.ok(pendingRule, 'keine Regel nimmt den wartenden Traeger aus dem Fluss');
+  assert.match(pendingRule.selector, /\.settings-scope\[data-pending\]/, 'der Reichweitenblock wartet nicht mit');
+  for (const decl of [/position:\s*absolute/, /visibility:\s*hidden/, /inset-inline:\s*0/]) assert.match(pendingRule.body, decl);
+});
+
+// ── R22 S8 (Critique a5, D13): Einstellungen ───────────────────────────────
+
+test('R22 D13: lange Erklaerungen vor dem ersten Feld - Kern vorn, der Rest hinter "Mehr dazu"', async () => {
+  const { hintFoldHtml } = await import('../public/settings/components.js');
+  const html = hintFoldHtml({ lead: 'Kern <b>', moreHtml: '<p class="form-hint">Rest</p>' });
+  assert.match(html, /<p class="form-hint">Kern &lt;b&gt;<\/p>/, 'der Kern steht als Hinweis da, escapt');
+  assert.match(html, /<details class="settings-hint-fold__more">\s*<summary class="settings-hint-fold__summary">[^<]+<i data-lucide="chevron-down"/,
+    'der Rest liegt in einem nativen details, der summary zuerst, mit Richtungspfeil');
+  assert.match(html, /<div class="settings-hint-fold__body"><p class="form-hint">Rest<\/p><\/div>/);
+
+  const displays = await readFile(new URL('../public/settings/pages/admin-displays.js', import.meta.url), 'utf8');
+  assert.match(displays, /hintFoldHtml\(\{\s*lead: t\('settings\.displaysLead'\),\s*moreHtml: `<p class="form-hint">\$\{esc\(t\('settings\.displaysMore'\)\)\}<\/p>\s*<p class="form-hint" id="display-areas-hint" hidden><\/p>/,
+    'Wandtabletts: zwei Saetze vorn, Uebersicht/Wand-Modus und die Bereiche im Aufklapper');
+  assert.doesNotMatch(displays, /displaysHint|style="margin/, 'kein Sieben-Zeilen-Absatz und keine Inline-Abstaende mehr');
+  const api = await readFile(new URL('../public/settings/pages/admin-api.js', import.meta.url), 'utf8');
+  assert.match(api, /hintFoldHtml\(\{\s*lead: t\('settings\.apiTokensHint'\),\s*moreHtml: `<p class="form-hint">\$\{esc\(t\('settings\.apiTokensMcpHint'\)\)\}<\/p>`/,
+    'API-Zugriff: der MCP-Absatz liegt im Aufklapper');
+  assert.doesNotMatch(api, /form-hint" style=/);
+
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  for (const key of ['displaysLead', 'apiTokensHint']) {
+    const sentences = de.settings[key].split(/(?<=[.!?])\s+/).length;
+    assert.ok(sentences <= 2, `${key}: ${sentences} Saetze vor dem ersten Feld`);
+  }
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const summary = [...eachRule(css)].find((r) => r.selector.trim() === '.settings-hint-fold__summary');
+  assert.ok(summary, 'der Ausloeser hat eine Regel');
+  assert.match(summary.body, /min-block-size:\s*var\(--target-base\)/, 'Zielgroesse der Geraetewelt');
+  assert.match(summary.body, /list-style:\s*none/);
+});
+
+test('R22 D13: Wetter und Wand verweisen gegenseitig auf ihren zweiten Ort (nur Wege, kein Zusammenlegen)', async () => {
+  const read = (p) => readFile(new URL(`../public/settings/pages/${p}`, import.meta.url), 'utf8');
+  const personalWeather = await read('personal-weather.js');
+  assert.match(personalWeather, /\$\{admin \? `<p class="form-hint settings-group__footer" id="pweather-household">\s*\$\{esc\(t\('settings\.weatherHouseholdLinkHint'\)\)\}\s*<a href="\/settings\/admin\/integrations\?section=admin-weather" id="pweather-household-link">\$\{esc\(t\('settings\.pageIntegrations'\)\)\}<\/a>/,
+    'Mein Wetter -> Fotos und Wetter (Abschnitt Wetter), nur fuer Admins');
+  assert.match(personalWeather, /renderPage\(container, prefs, \{ admin: user\?\.role === 'admin' \}\)/);
+  const adminWeather = await read('admin-weather.js');
+  assert.match(adminWeather, /<a href="\/settings\/personal\/weather" id="weather-personal-link">\$\{esc\(t\('settings\.pageWeather'\)\)\}<\/a>/,
+    'Fotos und Wetter -> Mein Wetter');
+  const appearance = await read('personal-appearance.js');
+  assert.match(appearance, /\$\{options\.isAdmin \? `<p class="form-hint settings-group__footer" id="wall-displays">\s*\$\{esc\(t\('settings\.wallDisplaysLinkHint'\)\)\}\s*<a href="\/settings\/admin\/displays" id="wall-displays-link">/,
+    'Dieses Geraet (Wand-Modus) -> Wandtabletts, nur fuer Admins');
+  const displays = await read('admin-displays.js');
+  assert.match(displays, /<a href="\/settings\/personal\/device" id="display-wall-mode-link">\$\{esc\(t\('settings\.pageDevice'\)\)\}<\/a>/,
+    'Wandtabletts -> Dieses Geraet (Wand-Modus)');
+  // Die Ziele sind echte Blaetter bzw. ein echter Abschnitt.
+  const integrations = findSettingsLeaf('/settings/admin/integrations', { role: 'admin' });
+  assert.ok(settingsSheetSections(integrations, { role: 'admin' }).some((s) => s.id === 'admin-weather'));
+  for (const path of ['/settings/personal/weather', '/settings/personal/device', '/settings/admin/displays']) {
+    assert.ok(findSettingsLeaf(path, { role: 'admin' }), path);
+  }
+  // Ein Weg im Hinweis ist als Weg zu sehen: reset.css nimmt Links Farbe und Unterstrich.
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const link = [...eachRule(css)].find((r) => !r.at.length && r.selector.trim() === ".settings-page :is(.form-hint, .settings-card-description) a:not([class*='btn'])");
+  assert.match(link?.body ?? '', /color:\s*var\(--color-accent\)/, 'der Verweis steht in Akzenttinte, nicht grau im Satz');
+});
+
+test('R22 D13: das Siegel steht am Blatt-Titel, nicht neben "< Einstellungen"', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  assert.match(shell, /seal\.className = 'module-seal settings-leaf-header__seal';\s*seal\.setAttribute\('aria-hidden', 'true'\);\s*seal\.insertAdjacentHTML\('beforeend', moduleIconHTML\(MODULE_ICON\.settings\)\);\s*heading\.append\(seal, settingsLeafLabel\(leaf, t\)\);/);
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const below = (sel) => rules.find((r) => r.at.some((a) => /\(max-width:\s*1023px\)/.test(a)) && r.selector.trim() === sel);
+  assert.match(below(".settings-shell-header[data-mode='leaf'] > .module-seal--head")?.body ?? '', /display:\s*none/,
+    'unter 1024px traegt der Kopf eines Blatts kein Siegel mehr');
+  assert.match(below('.settings-leaf-header__seal')?.body ?? '', /width:\s*var\(--target-sm\)/, 'Large-Title-Rang wie im Gesundheitsbereich');
+  assert.match(below('.settings-leaf-header__seal')?.body ?? '', /--seal-accent:\s*var\(--module-settings\)/, 'das Siegel nennt seine Herkunft (die Kopfrolle baut nur die Shell)');
+  const wide = rules.find((r) => r.at.some((a) => /\(min-width:\s*1024px\)/.test(a)) && r.selector.trim() === '.settings-leaf-header__seal');
+  assert.match(wide?.body ?? '', /display:\s*none/, 'ab 1024px traegt der Kopf das Siegel mit dem Modulnamen');
+});
+
+test('R22 D13: die Sprungmarken zeigen den Ueberlauf mit dem geteilten Anriss', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  const fn = shell.slice(shell.indexOf('function createSheetJump('), shell.indexOf('function syncJumpLabels('));
+  assert.match(fn, /nav\.appendChild\(list\);[\s\S]*wireScrollFade\(list\);\s*return nav;/);
+  assert.match(shell, /import \{ wireScrollFade \} from '\/utils\/ux\.js';/);
+});
+
+test('R22 D13: die Seitenleiste zeigt ihre Gruppen als Weg, solange sie ueberlaeuft', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  assert.match(shell, /navigation\.appendChild\(createNavigationIndex\(navigation, domains\)\);/);
+  const fn = shell.slice(shell.indexOf('function createNavigationIndex('), shell.indexOf('function revealActiveNavigationLink('));
+  assert.match(fn, /index\.setAttribute\('role', 'group'\)/);
+  assert.match(fn, /button\.type = 'button';/, 'Knoepfe, keine Hash-Links (die Adresse bleibt beim Blatt)');
+  assert.match(fn, /settings-shell__navigation--overflowing', now\)/);
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const shown = rules.find((r) => r.selector.trim() === '.settings-shell__navigation--overflowing .settings-shell__navigation-index');
+  assert.match(shown?.body ?? '', /position:\s*sticky/);
+  assert.match(shown?.body ?? '', /bottom:\s*calc\(-1 \* var\(--space-3\)\)/);
+  const hidden = rules.find((r) => r.selector.trim() === '.settings-shell__navigation-index');
+  assert.match(hidden?.body ?? '', /display:\s*none/, 'ohne Ueberlauf keine Zeile');
+  assert.ok(rules.some((r) => /navigation-results:not\(\[hidden\]\)\) \.settings-shell__navigation-index/.test(r.selector)), 'beim Suchen keine Zeile');
+  const item = rules.find((r) => r.selector.trim() === '.settings-shell__navigation-index-item');
+  assert.match(item?.body ?? '', /min-block-size:\s*var\(--target-md\)/);
+});
+
+test('R22 D13: der aktive Eintrag bleibt ueber der Bereichszeile sichtbar', async () => {
+  const { __test } = await import('/settings/shell.js');
+  const rect = (top, bottom) => ({ top, bottom, height: bottom - top });
+  const link = { getBoundingClientRect: () => rect(660, 694) };
+  const index = { getClientRects: () => [1], getBoundingClientRect: () => rect(650, 700) };
+  const navigation = {
+    scrollHeight: 1400, clientHeight: 600, offsetHeight: 600, scrollTop: 0,
+    getBoundingClientRect: () => rect(100, 700),
+    querySelector: (sel) => (sel.includes('--active') ? link : sel.includes('navigation-index') ? index : null),
+  };
+  __test.revealActiveNavigationLink(navigation);
+  assert.equal(navigation.scrollTop, 44, 'der Eintrag rueckt ueber die klebende Zeile (694 - 650)');
+});
+
+// R23 D14 (Critique G6 P2: Kalender-Blatt 3473px mit 12 Karten): die
+// Kalender-Synchronisation ist ein eigenes Blatt direkt hinter dem Kalender,
+// ohne zweite Statuszeile; lange Erklaerungen stehen hinter "Mehr dazu".
+test('R23: Kalender-Synchronisation als eigenes Blatt, Prosa hoechstens ein bis zwei Saetze vor dem Feld', async () => {
+  const sync = SETTINGS_LEAVES.find((leaf) => leaf.id === 'module-calendar-sync');
+  assert.equal(sync?.path, '/settings/modules/calendar-sync');
+  assert.equal(sync.moduleStatus, false, 'keine zweite Zeile "Kalender ist eingeschaltet"');
+  assert.deepEqual(settingsSheetSections(sync, admin).map((s) => s.id), ['sync-calendar']);
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  assert.match(shell, /if \(leaf\.moduleStatus === false\) return null;/);
+  for (const [file, key] of [['modules-active.js', 'activeModulesHint'], ['admin-permissions.js', 'permIntro'], ['sync-calendar.js', 'sync.backfillDescription']]) {
+    const src = await readFile(new URL(`../public/settings/pages/${file}`, import.meta.url), 'utf8');
+    assert.match(src, new RegExp(`hintFoldHtml\\(\\{ lead: t\\('settings\\.${key.replace('.', '\\.')}'\\), moreHtml: \`<p>\\$\\{esc\\(t\\('settings\\.${key.replace('.', '\\.')}More'\\)\\)\\}</p>\``), `${file}: der Rest steht hinter "Mehr dazu"`);
+  }
+});
+
+// R23 S10 (Critique G6 P3 "Index-Zeile markiert falsch"): markiert ist die
+// Gruppe des offenen Blatts, bis die Leiste von Hand bewegt wird; danach die
+// Gruppe ueber dem oberen Drittel, ganz oben die erste, am Ende die letzte.
+test('R23: die Bereichszeile markiert, was man sieht', async () => {
+  const shell = await readFile(new URL('../public/settings/shell.js', import.meta.url), 'utf8');
+  const fn = shell.slice(shell.indexOf('function createNavigationIndex('), shell.indexOf('function createSheetSkipLink('));
+  assert.match(fn, /const active = !userScrolled && navigation\.querySelector\('\.settings-shell__navigation-link--active'\);/);
+  assert.match(fn, /const line = edge \+ \(bottom - edge\) \/ 3;/);
+  assert.match(fn, /if \(top <= line \|\| !current \|\| \(atEnd && top < bottom\)\) current = group\.dataset\.domainId;/);
+  assert.match(fn, /if \(navigation\.scrollTop <= 0\) current = /);
+  assert.match(fn, /for \(const type of \['wheel', 'touchmove', 'keydown', 'pointerdown'\]\) navigation\.addEventListener\(type, byUser/);
+});
+
+// R23 S10 (Critique G6 P3 "Konto mobil 50/50", "Wochenstart-Vorschau wirkt bedienbar").
+test('R23: Textfelder stapeln am Telefon unter ihrem Label; die Wochenstart-Vorschau ist ein Kopf, keine Knoepfe', async () => {
+  const { eachRule } = await import('./css-rules.js');
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const stacked = rules.find((r) => r.at.some((a) => /max-width:\s*639px/.test(a))
+    && /settings-setting-row:has\(> \.settings-setting-row__control > input\.form-input:only-child/.test(r.selector)
+    && !/__control/.test(r.selector.split(':has(')[0].slice(-30)) && /grid-template-columns:\s*minmax\(0, 1fr\)/.test(r.body));
+  assert.ok(stacked, 'am Telefon eine Spalte fuer eine Zeile mit einem Textfeld');
+  const cell = rules.find((r) => r.selector.trim() === '.week-start-preview__cell' && !r.at.length);
+  assert.doesNotMatch(cell.body, /border:/, 'keine Kaestchen');
+  const start = rules.find((r) => r.selector.trim() === '.week-start-preview__cell--start' && !r.at.length);
+  assert.doesNotMatch(start.body, /background:/, 'keine Fuellung wie ein gewaehlter Knopf');
+});
+
+// R23 S10 (Critique G6 P3 "Suche ohne Synonyme"): die Einstellungssuche kennt
+// die Woerter, die Menschen in ihrer Sprache tippen.
+test('R23: die Einstellungssuche findet Synonyme ("Dark Mode", "Kennwort", "Kiosk")', async () => {
+  const de = JSON.parse(await readFile(new URL('../public/locales/de.json', import.meta.url), 'utf8'));
+  const translate = (key) => key.split('.').reduce((o, k) => o?.[k], de) ?? key;
+  const found = (q) => searchSettings(q, { user: admin, translate }).options.map((o) => o.key);
+  assert.ok(found('dark mode').includes('settings.sectionDesign'));
+  assert.ok(found('kennwort').includes('settings.changePassword'));
+  assert.ok(found('kiosk').includes('settings.wallModeLabel'));
+  assert.ok(found('24 stunden').includes('settings.timeFormatLabel'));
+});
+
+// R23 S11 (optimize): zwei Load-Shifts im Rechte-Blatt.
+test('R23: das Rechte-Blatt rutscht nicht und rechnet nur die Gruppen in Sicht', async () => {
+  const css = await readFile(new URL('../public/styles/settings.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  // Der -8px-Rand der Einleitung kollabierte erst mit dem Kopfrand, wenn das
+  // Skelett wich: das ganze Blatt rutschte 8px hoch (0,0068 mobil).
+  const intro = rules.filter((r) => r.selector.trim() === '.settings-section__intro');
+  assert.ok(intro.length > 0);
+  for (const r of intro) assert.doesNotMatch(r.body, /margin[^;]*-1|margin[^;]*calc\([^)]*\*\s*-1/, `kein negativer Rand: ${r.body}`);
+  // 16 Gruppen, 3600px: ausser Sicht ueberspringt der Browser sie.
+  const cv = rules.find((r) => r.selector.trim() === '.perm-modgroup + .perm-modgroup' && /content-visibility/.test(r.body));
+  assert.match(cv?.body ?? '', /content-visibility:\s*auto/);
+  assert.match(cv?.body ?? '', /contain-intrinsic-size:\s*auto none auto/);
+  assert.match(cv?.body ?? '', /overflow-clip-margin/, 'der Fokusring darf ueber die Gruppenkante');
 });

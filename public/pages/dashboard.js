@@ -15,6 +15,7 @@ import { hasEventIcon, eventIconHtml } from '/utils/event-icon.js';
 import { compareMembers, sortMembers } from '/utils/member-order.js';
 import { buildWeekStrip } from '/utils/week-strip.js';
 import { relativeDateLabel, housekeepingSinceLabel } from '/utils/day-label.js';
+import { daysFromTodayText, dateText } from '/utils/date-format.js';
 import { esc, fmtLocation, renderMarkdownLight } from '/utils/html.js';
 import { initials } from '/utils/initials.js';
 // `todayKey` heisst hier schon ein Parameter (bzw. eine lokale Bindung), der den
@@ -58,6 +59,7 @@ import { whoMark } from '/utils/seal-pair.js';
 import { MODULE_ICON, moduleIconHTML } from '/nav-icons.js';
 import { enterWallMode, exitWallMode, isWallActive, syncWallMode } from '/utils/wall-mode.js';
 import { mountZonePrompt } from '/utils/household-zone-hint.js';
+import { mountFirstSteps, startFirstSteps } from '/utils/first-steps.js';
 import { renderWallTimer, wireWallTimer } from '/components/wall-timer.js';
 import { rememberLayoutHint, layoutHintTiles, layoutHintQuery } from '/utils/dashboard-layout-hint.js';
 import { emptyHintHTML } from '/utils/empty-state.js';
@@ -72,6 +74,7 @@ import { wireNoteCategoryOverflow } from '/utils/note-category-overflow.js';
 import { installPopoverMenus, popoverMenuHtml } from '/utils/popover-menu.js';
 import { nextRewardGoal } from '/utils/reward-goal.js';
 import { reloadAfterSave } from '/utils/reload-after-save.js';
+import { shiftTypeLabel } from '/utils/shift-label.js';
 
 // Hält den AbortController des aktuellen FAB-Listeners - wird bei jedem render() erneuert.
 let _fabController = null;
@@ -410,9 +413,13 @@ function getOnboardingSteps() {
   // Leiste und Plus-Knopf nur in Worten. Schritt 1 traegt jetzt das Zeichen
   // (utils/brand-mark.js), Schritt 2 und 3 zeigen auf das Bedienelement, das
   // der Text nennt (`target`, siehe placeSpotlight in showOnboarding).
+  // SCHRITT 2 ZEIGT MODULE, KEINEN KOMPASS (R22 S9, Critique a1): `navigation`
+  // ist in Lucide der Ortungspfeil - er las sich als „Standort", der Text
+  // spricht von Leiste und Modulen. Schritt 3 verspricht das Wischen nur dort,
+  // wo es Zeilen gibt, die es koennen (Aufgaben, Einkauf, Vorrat).
   return [
     { mark: true,           title: t('onboarding.step1Title', { name: appName }), body: t('onboarding.step1Body') },
-    { icon: 'navigation',   title: t('onboarding.step2Title'), body: t(desktop ? 'onboarding.step2BodyDesktop' : 'onboarding.step2Body'),
+    { icon: 'layout-grid',  title: t('onboarding.step2Title'), body: t(desktop ? 'onboarding.step2BodyDesktop' : 'onboarding.step2Body'),
       target: () => document.querySelector(desktop ? '.nav-sidebar' : '.nav-bottom__items') },
     { icon: 'plus-circle',  title: t('onboarding.step3Title'), body: t(desktop ? 'onboarding.step3BodyDesktop' : 'onboarding.step3Body'),
       target: () => [...document.querySelectorAll('.page-fab')].find(isShownOnScreen) ?? null },
@@ -594,7 +601,23 @@ function showOnboarding(appContainer, onDone) {
       next?.focus();
     });
 
-    if (!isLast) actions.appendChild(skipBtn);
+    // EIN SCHRITT ZURUECK (R23 S10, Critique G6 P3 "Tour ohne Zurueck"): wer
+    // den Text zur Leiste zu schnell weggetippt hat, kam nur durch einen
+    // Neustart des Rundgangs zurueck. Ab Schritt 2 steht "Zurueck" vorn, wo
+    // auf Schritt 1 "Ueberspringen" steht (Zurueck-Geste und Esc beenden ihn
+    // weiterhin, attachOverlay unten).
+    const backBtn = document.createElement('button');
+    backBtn.className = 'btn btn--ghost';
+    backBtn.textContent = t('common.back');
+    backBtn.addEventListener('click', () => {
+      current--;
+      let next = null;
+      swapContent(stepEl, () => { next = fillStep(); }, { direction: -1 });
+      next?.focus();
+    });
+
+    if (current > 0) actions.appendChild(backBtn);
+    else if (!isLast) actions.appendChild(skipBtn);
     actions.appendChild(nextBtn);
     stepEl.appendChild(icon);
     stepEl.appendChild(title);
@@ -1017,8 +1040,8 @@ function formatDueDate(dateStr, timeStr) {
   // Die Stempel gehen als STRING an die Formatierer, nicht als Date: nur so
   // bleibt die Wanduhrzeit, was sie ist (siehe oben).
   const fullLabel = dueTime
-    ? `${formatDate(dueStamp)}, ${formatTime(dueStamp)}` // beide aus i18n.js
-    : formatDate(dayKey);
+    ? `${dateText(dueStamp)}, ${formatTime(dueStamp)}` // beide aus i18n.js
+    : dateText(dayKey);
 
   if (overdue) {
     return { text: `${t('dashboard.overdue')} - ${fullLabel}`, overdue: true };
@@ -1434,7 +1457,9 @@ function buildTodayProgram(data, { includeTasks = true, includeCalendar = true, 
       sub: MEAL_LABELS()[highlights.mealType] ?? t('dashboard.todayDinner'),
       icon: MEAL_ICONS[highlights.mealType] ?? 'utensils',
       tone: 'dinner',
-      route: '/meals',
+      // Die Mahlzeit selbst, nicht die Wurzel des Plans (R22, D3): der
+      // Essensplan holt ihre Karte ins Bild und oeffnet ihr Blatt.
+      route: highlights.meal.id != null ? `/meals?open=${encodeURIComponent(String(highlights.meal.id))}` : '/meals',
       // Wer kocht (#1679): dasselbe Ueberlappungszeichen wie bei Termin und
       // Aufgabe - "wen geht es an" ist bei einer Mahlzeit der Koch. Ohne Koch
       // bleibt die Zeile, wie sie war.
@@ -1885,11 +1910,8 @@ export function renderUpcomingBirthdays(allBirthdays, size, total = null) {
   }
 
   const items = birthdays.map((b) => {
-    const daysLabel = b.days_until === 0
-      ? t('common.today')
-      : b.days_until === 1
-        ? t('common.tomorrow')
-        : t('dashboard.daysLeft', { count: b.days_until });
+    // "in 9 Tagen" wie im Geburtstagsmodul (R23, D11), nicht "9 Tage".
+    const daysLabel = daysFromTodayText(b.days_until);
     // Familien-Geburtstage tragen die Identitaetsfarbe des Mitglieds - dieselbe
     // Farbsprache wie die Familien-Kachel daneben; vorher trug hier jede Zeile
     // die Modul-Toenung, und dieselbe Person war in einer Kachel leuchtend und
@@ -2391,7 +2413,7 @@ function renderFamilyWidget(users, data, { manageHref = null } = {}) {
     const myShift = scheduleEntriesToday.find((entry) => Number(entry.user_id) === Number(u.id) && entry.shift_type);
     if (myShift) {
       const type = myShift.shift_type;
-      parts.push(esc(type.short_code ? `${type.short_code} · ${type.name}` : type.name));
+      parts.push(esc(shiftTypeLabel(type)));
     }
     const open = openByUser.get(u.id) ?? 0;
     if (open > 0) parts.push(esc(t('dashboard.memberOpenTasks', { count: open })));
@@ -2723,7 +2745,7 @@ function metricTileFor(id, data, currency, sheetSpeaks = new Set()) {
       const days = next.days_until;
       return {
         id, route, icon: widgetIcon('birthdays'), label: t('nav.birthdays'),
-        value: days === 0 ? t('common.today') : days === 1 ? t('common.tomorrow') : t('dashboard.daysLeft', { count: days }),
+        value: daysFromTodayText(days),
         note: next.kind === 'name_day' ? `${next.name} · ${t('birthdays.nameDay')}` : next.name,
       };
     }
@@ -3088,7 +3110,7 @@ function earnedWhenLabel(value) {
   const today = householdToday();
   if (day === today) return t('common.today');
   if (day === addLocalDays(today, -1)) return t('common.yesterday');
-  return day.slice(0, 4) === today.slice(0, 4) ? formatDayMonth(value) : formatDate(value);
+  return dateText(value);
 }
 
 function renderRewardsSelf(me, rewards, spans) {
@@ -3112,6 +3134,24 @@ function renderRewardsSelf(me, rewards, spans) {
   // Praemien- und Geld-Anfragen (#1734) zusammen: der Server fuehrt sie
   // getrennt, die Kachel sagt, wie viele warten.
   const pending = (Number(rewards.pending) || 0) + (Number(rewards.moneyPending) || 0);
+  // DIE KLEINE KACHEL FUELLT NUR, WAS IHR DIE REIHE SCHENKT (R22 S10, aus S9).
+  // 1x1 neben Familie und Geburtstagen streckt die Reihe sie auf deren Hoehe,
+  // und unter Ziel und Anfrage stand leere Flaeche. Der Verlauf steht deshalb
+  // auch hier - aber in einer Flaeche ohne eigene Hoehe (dashboard.css,
+  // `.rewards-recent--fill`): er nimmt nur den Ueberschuss, ganze Zeilen oder
+  // keine. In einer Reihe kurzer Kacheln bleibt die Kachel so kurz wie bisher.
+  const fill = recentCap === 0
+    ? (Array.isArray(rewards.recent) ? rewards.recent : []).slice(0, 3)
+    : [];
+  const fillHTML = fill.length ? `
+      <ul class="rewards-recent rewards-recent--fill" aria-label="${esc(t('dashboard.rewardsRecent'))}">
+        ${fill.map((row, i) => `
+          <li class="rewards-recent__row"${i === 0 ? ` data-recent-title="${esc(t('dashboard.rewardsRecent'))}"` : ''}>
+            <span class="rewards-recent__delta">+${esc(formatPoints(row.delta))}</span>
+            <span class="rewards-recent__reason">${esc(row.reason || t(`rewards.ledgerType.${row.type}`))}</span>
+            <span class="rewards-recent__when">${esc(earnedWhenLabel(row.created_at))}</span>
+          </li>`).join('')}
+      </ul>` : '';
   return `
     <div class="widget__body rewards-widget rewards-widget--self">
       <div class="rewards-self">
@@ -3122,6 +3162,7 @@ function renderRewardsSelf(me, rewards, spans) {
         ${recentHTML}
       </div>
       ${pending > 0 ? rewardsFooterHTML(t('dashboard.rewardsOwnPending', { count: pending })) : ''}
+      ${fillHTML}
     </div>`;
 }
 
@@ -3532,7 +3573,7 @@ function renderScheduleWidget(schedule, users, size) {
       ? `<img src="${esc(user.avatar_data)}" alt="" loading="lazy">`
       : esc(initials(user?.display_name ?? ''));
     const shiftLabel = type
-      ? esc(type.short_code ? `${type.short_code} · ${type.name}` : type.name)
+      ? esc(shiftTypeLabel(type))
       : esc(t('schedule.freeDay'));
     const swatchColor = type ? type.color : 'var(--color-border)';
     // Eigene Punkt-Klasse statt `.schedule-swatch` (schedule.css): router.js
@@ -3705,7 +3746,7 @@ function renderWasteWidget(waste, size) {
       ? next.origins.find((o) => o.kind === 'schedule' && o.original_date)?.original_date
       : null;
     const moved = next.moved
-      ? `<i data-lucide="move" class="waste-widget-row__flag" aria-label="${esc(t('waste.movedFromBadge', { date: movedOriginal ? formatDate(movedOriginal) : '' }))}"></i>`
+      ? `<i data-lucide="move" class="waste-widget-row__flag" aria-label="${esc(t('waste.movedFromBadge', { date: movedOriginal ? dateText(movedOriginal) : '' }))}"></i>`
       : '';
     const coalesced = next.coalesced
       ? `<i data-lucide="layers" class="waste-widget-row__flag" aria-label="${esc(t('waste.coalescedHint'))}"></i>`
@@ -4375,17 +4416,31 @@ function renderTodayCockpit(data, cfg = [], editing = false, { now = new Date(),
   // Die Sammelzeile gibt es nur auf dem Telefon; dort teilt sich die Liste nie.
   const grouped = model.rows.some((row) => row.kind === 'overdue');
   const split = model.rows.length >= 2 && !grouped;
-  const perColumn = Math.ceil(model.rows.length / 2);
+  // BEI UNGERADER ZAHL SPANNT DIE LETZTE ZEILE (R22 D16). Mit `ceil` blieb
+  // rechts unten eine leere Zelle, und die Haarlinie darueber endete im Nichts.
+  // Jetzt teilen sich die ersten 2k Zeilen die Spalten, die letzte steht ueber
+  // die volle Breite darunter - gelesen wird links, rechts, dann „und zuletzt".
+  const perColumn = Math.floor(model.rows.length / 2);
+  const columnClass = (index) => {
+    if (!split) return '';
+    if (index >= perColumn * 2) return ' today-cockpit-card--span';
+    if (index < perColumn) return '';
+    return ` today-cockpit-card--col2${index === perColumn ? ' today-cockpit-card--col-start' : ''}`;
+  };
   listRows.push(...model.rows.map((row, index) => (row.kind === 'overdue'
     ? renderTodayOverdueGroup(row, overdueOpen)
-    : renderTodayRow(row, split && index >= perColumn
-      ? ` today-cockpit-card--col2${index === perColumn ? ' today-cockpit-card--col-start' : ''}`
-      : ''))));
+    : renderTodayRow(row, columnClass(index)))));
   const parts = [];
   const foldShopping = Boolean(model.shopping) && model.overflow > 0 && !model.moreRoute && onPhoneStage();
   if (listRows.length) {
     parts.push(`<div class="today-cockpit__rows${split ? ' today-cockpit__rows--split' : ''}"${split ? ` style="--today-rows-per-column:${perColumn}"` : ''}>${listRows.join('')}</div>`);
   }
+  // DER EINKAUF STEHT VOR DEM AUFKLAPPER (R22 D16). Er folgte „+4 weitere
+  // heute" und las sich wie eine der verdeckten Zeilen, die schon aufgeklappt
+  // ist. Er ist die zeitlose Schlusszeile des SICHTBAREN Programms; der
+  // Aufklapper schliesst das Blatt ab. Auf dem Telefon klappt er weiter mit
+  // (`foldShopping`, R14).
+  if (model.shopping && !foldShopping) parts.push(renderTodayRow(model.shopping));
   if (model.overflow > 0 && model.moreRoute) {
     const moreText = esc(t('dashboard.todayMore', { count: model.overflow }));
     parts.push(`<a href="${esc(model.moreRoute)}" class="today-cockpit__more today-cockpit__more--link" data-route="${esc(model.moreRoute)}">
@@ -4407,7 +4462,6 @@ function renderTodayCockpit(data, cfg = [], editing = false, { now = new Date(),
           <span>${esc(moreOpen ? lessText : moreText)}</span><i data-lucide="chevron-down" class="icon-sm today-cockpit__more-icon" aria-hidden="true"></i>
         </button>`);
   }
-  if (model.shopping && !foldShopping) parts.push(renderTodayRow(model.shopping));
   if (model.coda) parts.push(`<div class="today-cockpit__coda">${esc(model.coda)}</div>`);
 
   // Deckt der Nutzer alle vier Domänen über Widgets ab, wäre das Cockpit leer —
@@ -5320,22 +5374,36 @@ function renderHiddenWidgetsTray(cfg, glanceHidden = false) {
    * Seite: das Cockpit und das Kopfband sprechen ueber dieselben Aufgaben.
    * Ohne diesen Knopf muesste man die Kachel erst einblenden, um einzustellen,
    * was die Kachel gar nicht zeigt. Deshalb eine Gruppe statt eines Chips: ein
-   * Knopf im Knopf waere kein gueltiges Markup. */
-  const chips = glanceChip + hidden.map((w) => `
-    <div class="widget-restore-chip-group">
+   * Knopf im Knopf waere kein gueltiges Markup.
+   *
+   * DIE OPTIONEN STEHEN AM CHIP, IN EINEM MENUE MIT WORT (R22 D16). Bis R21
+   * stand neben vier der Chips ein freier Regler-Kreis ohne Wort - 17 Chips
+   * und vier unbeschriftete Knoepfe, die keiner einem Chip zuordnete. Jetzt
+   * ist der Chip ein geteilter Knopf: links „einblenden" mit einem Tipp wie
+   * bisher, rechts am selben Pill ein Pfeil mit dem Menue „<Kachel>
+   * einblenden" und „Optionen fuer <Kachel>". */
+  const chips = glanceChip + hidden.map((w) => {
+    const label = widgetLabel(w.id);
+    const menu = widgetHasOptions(w.id) ? popoverMenuHtml({
+      id: `widget-restore-menu-${w.id}`,
+      label: t('common.moreActionsNamed', { name: label }),
+      icon: 'chevron-down',
+      triggerClass: 'widget-restore-chip__more',
+      items: [
+        { action: 'widget-show', icon: 'plus', label: t('dashboard.customizeShow', { widget: label }), attrs: { 'data-widget-show': w.id } },
+        { action: 'widget-options', icon: 'sliders-horizontal', label: t('dashboard.optionsFor', { widget: label }), attrs: { 'data-widget-options': w.id } },
+      ],
+    }) : '';
+    return `
+    <div class="widget-restore-chip-group${menu ? ' widget-restore-chip-group--split' : ''}">
       <button type="button" class="widget-restore-chip" data-widget-show="${esc(w.id)}"
-              aria-label="${esc(t('dashboard.customizeShow', { widget: widgetLabel(w.id) }))}">
+              aria-label="${esc(t('dashboard.customizeShow', { widget: label }))}">
         <i data-lucide="${widgetIcon(w.id)}" class="widget-restore-chip__icon" aria-hidden="true"></i>
-        <span class="widget-restore-chip__label">${esc(widgetLabel(w.id))}</span>
+        <span class="widget-restore-chip__label">${esc(label)}</span>
         <i data-lucide="plus" class="widget-restore-chip__add" aria-hidden="true"></i>
-      </button>
-      ${widgetHasOptions(w.id) ? `
-      <button type="button" class="widget-restore-chip__options" data-widget-options="${esc(w.id)}"
-              aria-label="${esc(t('dashboard.optionsFor', { widget: widgetLabel(w.id) }))}"
-              title="${esc(t('dashboard.optionsFor', { widget: widgetLabel(w.id) }))}">
-        <i data-lucide="sliders-horizontal" aria-hidden="true"></i>
-      </button>` : ''}
-    </div>`).join('');
+      </button>${menu}
+    </div>`;
+  }).join('');
   return `
     <section class="widget-restore" aria-label="${t('dashboard.customizeHiddenTitle')}">
       <h3 class="widget-restore__title">${t('dashboard.customizeHiddenTitle')}</h3>
@@ -6258,18 +6326,35 @@ function renderWallWho(data, model, budget = WALL_WHO_LADDER[0]) {
     // Aufgaben kommt ungekappt aus `wallTasks` (#1817).
     for (const id of rowPeopleIds(row)) {
       inProgram.add(id);
-      if (row.kind !== 'task') otherRows.set(id, (otherRows.get(id) ?? 0) + 1);
+      if (row.kind !== 'task') otherRows.set(id, [...(otherRows.get(id) ?? []), { title: row.title }]);
     }
   }
+  // DIE ZAHL IST DIE LISTE (R23, Critique G1 P2). Die Zahl am Gesicht zaehlt,
+  // was heute vor der Person liegt - Aufgaben UND ihr Termin, ihr Kochen
+  // (#1679) -, die Titel darunter nannten aber nur Aufgaben: Leo trug „3"
+  // ueber „Klavier ueben", Emma „1" ueber nichts. Die Programmzeilen der Person
+  // stehen deshalb als offene Zeilen VOR ihren Aufgaben, mit derselben Leiter
+  // und derselben Zaehlzeile - was an Titeln steht plus „+N weitere" ist die
+  // Zahl. Die Aufgabenzeilen des Programms bleiben draussen (siehe oben).
   const tasksOf = new Map();
   for (const entry of Array.isArray(data?.wallTasks) ? data.wallTasks : []) {
     if (entry?.user_id != null) tasksOf.set(entry.user_id, entry);
   }
+  const entryOf = (id) => {
+    const entry = tasksOf.get(id);
+    const others = otherRows.get(id) ?? [];
+    if (!others.length) return entry;
+    const open = Array.isArray(entry?.open) ? entry.open : [];
+    const openTotal = Math.max(Number(entry?.open_count) || 0, open.length);
+    return { ...entry, open: [...others, ...open], open_count: openTotal + others.length };
+  };
   // Der Plan auf der OBERSTEN Stufe sagt, wer ueberhaupt etwas hat - die
   // Rangfolge darf sich nicht aendern, waehrend die Leiter hinabsteigt.
-  const totals = new Map(users.map((u) => [u.id, planWallWhoLines(tasksOf.get(u.id), WALL_WHO_LADDER[0])]));
+  const totals = new Map(users.map((u) => [u.id, planWallWhoLines(entryOf(u.id), WALL_WHO_LADDER[0])]));
+  // Die Aufgabenbilanz fuer Screenreader bleibt eine Aufgabenbilanz.
+  const taskTotals = new Map(users.map((u) => [u.id, planWallWhoLines(tasksOf.get(u.id), WALL_WHO_LADDER[0])]));
 
-  const ahead = (u) => totals.get(u.id).openTotal + (otherRows.get(u.id) ?? 0);
+  const ahead = (u) => totals.get(u.id).openTotal;
 
   const onDuty = users
     .filter((u) => inProgram.has(u.id) || totals.get(u.id).openTotal > 0 || totals.get(u.id).doneTotal > 0)
@@ -6277,7 +6362,7 @@ function renderWallWho(data, model, budget = WALL_WHO_LADDER[0]) {
     .sort((a, b) => (ahead(b) - ahead(a)) || compareMembers(a, b));
 
   const shown = onDuty.slice(0, WALL_WHO_CAP);
-  const plans = new Map(shown.map((u) => [u.id, planWallWhoLines(tasksOf.get(u.id), budget)]));
+  const plans = new Map(shown.map((u) => [u.id, planWallWhoLines(entryOf(u.id), budget)]));
   const withTitles = shown.some((u) => {
     const plan = plans.get(u.id);
     return plan.open.length || plan.done.length || plan.moreOpen || plan.moreDone;
@@ -6287,7 +6372,8 @@ function renderWallWho(data, model, budget = WALL_WHO_LADDER[0]) {
     ? `<ul class="wall-who__list${withTitles ? ' wall-who__list--tasks' : ''}">${shown.map((u) => {
         const color = u.avatar_color || AVATAR_FALLBACK_COLOR;
         const plan = plans.get(u.id);
-        const { openTotal, doneTotal } = plan;
+        const { doneTotal } = plan;
+        const { openTotal } = taskTotals.get(u.id);
         const count = ahead(u);
         const mark = count > 0
           ? `<span class="wall-who__count">
@@ -6353,10 +6439,13 @@ function renderWallWho(data, model, budget = WALL_WHO_LADDER[0]) {
  *
  * @returns {number} die Stufe, auf der die Flaeche steht (-1: nichts zu tun)
  */
-function fitWallWho(root, data, { now = new Date(), reset = false } = {}) {
+function fitWallWho(root, data, { now = new Date(), reset = false, isDisplay = false } = {}) {
   const wall = root?.querySelector?.('.wall');
-  if (!wall?.querySelector('.wall__who')) return -1;
   const overflows = () => wall.scrollHeight > (globalThis.window?.innerHeight ?? 0) + 1;
+  if (!wall?.querySelector('.wall__who')) {
+    if (wall && overflows() && !wallIsStacked(wall)) shedWallProgram(wall, data, overflows, { now, isDisplay });
+    return -1;
+  }
   if (!reset && !overflows()) return 0;
 
   // `allRows` haengt nicht am Deckel, der Timer spielt hier also keine Rolle.
@@ -6400,7 +6489,55 @@ function fitWallWho(root, data, { now = new Date(), reset = false } = {}) {
   const lowest = Math.min(...heights);
   const free = heights.findIndex((height) => height <= lowest + 1);
   if (free !== step) place(free);
+  // Und laeuft sie dann noch ueber, ist das Programm der Grund (R23). Hat es
+  // Zeilen abgegeben, duerfen unter den Gesichtern wieder Titel stehen, die
+  // jetzt nichts mehr kosten - von der stehenden Stufe aufwaerts, eine nach
+  // der anderen, bis die naechste nicht mehr passt (jede Probe ist ein
+  // Layout; meist reicht der Platz fuer keine oder eine Stufe).
+  if (overflows() && shedWallProgram(wall, data, overflows, { now, isDisplay }) > 0) {
+    let kept = free;
+    let current = free;
+    for (let richer = free - 1; richer >= 0; richer -= 1) {
+      place(richer);
+      current = richer;
+      if (overflows()) break;
+      kept = richer;
+    }
+    if (current !== kept) place(kept);
+    return kept;
+  }
   return free;
+}
+
+/**
+ * DAS PROGRAMM GIBT ZEILEN AB, WENN DAS TABLETT NICHT REICHT (R23, Critique
+ * G1 P2). `WALL_ROW_CAP` ist fuer 1280x800 gerechnet; auf 768x1024 (hochkant
+ * an der Wand) lief die Flaeche 25px, auf 1024x768 45px aus dem Bild - und
+ * genau dort, wo „Wer heute dran ist" schon auf der letzten Stufe stand, also
+ * nichts mehr hergab. Eine Wand scrollt nicht. Dieselbe Regel wie die Leiter:
+ * gemessen, nicht gerechnet - eine Zeile nach der anderen weicht in
+ * „+N weitere heute", das aus demselben Modell zaehlt, bis die Flaeche passt;
+ * zwei Zeilen bleiben immer. Jeder Neuaufbau beginnt wieder beim vollen
+ * Deckel. Das Telefon scrollt ohnehin und gibt nichts ab.
+ *
+ * @returns {number} wie viele Zeilen gewichen sind
+ */
+function shedWallProgram(wall, data, overflows, { now = new Date(), isDisplay = false } = {}) {
+  let section = wall.querySelector?.('.wall__program');
+  if (!section) return 0;
+  let rows = section.querySelectorAll('.wall-program__list > .wall-row:not(.wall-row--shopping):not(.wall-row--state)').length;
+  let shed = 0;
+  while (rows > 2 && overflows()) {
+    rows -= 1;
+    const model = buildTodayCockpitModel(data, [], { cap: rows, now, groupOverdue: false, isDisplay });
+    section.insertAdjacentHTML('afterend', renderWallProgram(model));
+    const next = section.nextElementSibling;
+    section.remove();
+    section = next;
+    if (globalThis.window?.lucide && section) globalThis.window.lucide.createIcons({ el: section });
+    shed += 1;
+  }
+  return shed;
 }
 
 /**
@@ -6435,7 +6572,7 @@ function createWallFit(win, signal) {
     if (!shown || frame) return;
     frame = win.requestAnimationFrame(() => {
       frame = 0;
-      if (shown) fitWallWho(shown.shell, shown.data, { reset: true });
+      if (shown) fitWallWho(shown.shell, shown.data, { reset: true, isDisplay: shown.isDisplay });
     });
   }, { signal, passive: true });
   signal.addEventListener('abort', () => {
@@ -6443,9 +6580,9 @@ function createWallFit(win, signal) {
     shown = null;
   }, { once: true });
   return {
-    show(shell, data) {
-      shown = { shell, data };
-      return fitWallWho(shell, data);
+    show(shell, data, { isDisplay = false } = {}) {
+      shown = { shell, data, isDisplay };
+      return fitWallWho(shell, data, { isDisplay });
     },
   };
 }
@@ -6467,7 +6604,7 @@ function rebuildWall(container, shell, { data, weather, failed, updatedAt, reren
   restoreFocusAfterRebuild(container, [keepFocus, takeWallFocusIntent('enter') ? '#wall-surface' : null]);
   // Die Titel unter den Gesichtern folgen dem Platz: nach jedem Aufbau von der
   // obersten Stufe hinab.
-  return fit.show(shell, data);
+  return fit.show(shell, data, { isDisplay });
 }
 
 /**
@@ -6909,6 +7046,63 @@ async function openTaskFromOverview(taskId, container, rerender, user) {
   }
 }
 
+/**
+ * Der Termin hinter einer Kalender-Adresse (`/calendar?open=<id>&date=..`) -
+ * oder null. Heute-Blatt, Termin-Kachel und Countdown nennen ihren Termin so.
+ */
+export function eventLinkOf(route) {
+  if (typeof route !== 'string' || !route.startsWith('/calendar?')) return null;
+  const params = new URLSearchParams(route.slice('/calendar?'.length));
+  const id = params.get('open');
+  if (!id || !/^\d+$/.test(id)) return null;
+  return { id, date: params.get('date') };
+}
+
+/**
+ * Ob eine Zeile der Uebersicht zu einem Termin gehoert, den das Blatt gerade
+ * loescht (R22-F). `scope` ist die Angabe des Kalenders
+ * (scheduleCalendarDeleteWithUndo): ein Einzeltermin oder die ganze Serie
+ * nimmt alle seine Zeilen mit, "nur dieser" den einen Tag, "dieser und
+ * folgende" alle Tage ab dem Vorkommen.
+ */
+export function eventRowRemovedBy(link, scope) {
+  if (!link || !scope) return false;
+  const ids = [scope.eventId, scope.seriesId].filter((id) => id != null).map(String);
+  if (!ids.includes(String(link.id))) return false;
+  if (scope.scope === 'this') return !link.date || link.date === scope.occurrenceDate;
+  if (scope.scope === 'following') {
+    const from = String(scope.recurrenceId ?? '').slice(0, 10);
+    return !link.date || !from || link.date >= from;
+  }
+  return true;
+}
+
+/**
+ * DER TERMIN OEFFNET UEBER DER UEBERSICHT (Critique R22, D3), wie die
+ * Aufgabe daneben (openTaskFromOverview): das Blatt des Kalenders, die
+ * Uebersicht bleibt stehen. Seit R22-F wird dort auch bearbeitet und
+ * geloescht: danach zeichnet sich die Uebersicht neu (`rerender`), und
+ * waehrend der Rueckgaengig-Frist sind die Zeilen des Termins ausgeblendet.
+ * Scheitert das Laden, fuehrt die Zeile wie bisher in den Kalender - ein
+ * Fehler soll den Weg nicht verschliessen.
+ */
+async function openEventFromOverview(link, anchor, { container = null, rerender = null, user = null } = {}) {
+  const onRemoving = (scope, removing) => {
+    container?.querySelectorAll('[data-route]').forEach((row) => {
+      if (eventRowRemovedBy(eventLinkOf(row.dataset.route), scope)) row.hidden = removing;
+    });
+  };
+  try {
+    const { openEventById } = await import('/pages/calendar.js');
+    await openEventById(link.id, { date: link.date, anchor, user, onChanged: rerender, onRemoving });
+  } catch (err) {
+    console.error('[Dashboard] Termin konnte nicht geöffnet werden:', err);
+    const params = new URLSearchParams({ open: link.id });
+    if (link.date) params.set('date', link.date);
+    window.yuvomi.navigate(`/calendar?${params.toString()}`);
+  }
+}
+
 // --------------------------------------------------------
 // Navigations-Links verdrahten
 // --------------------------------------------------------
@@ -6933,7 +7127,12 @@ function wireLinks(container, rerender, { editing = false, user = null } = {}) {
       });
       return;
     }
-    const go = () => window.yuvomi.navigate(el.dataset.route);
+    // Ein Termin oeffnet sein Blatt ueber der Uebersicht (R22, D3); Cmd- und
+    // Mittelklick auf einen Link behalten unten ihren neuen Tab.
+    const eventLink = editing ? null : eventLinkOf(el.dataset.route);
+    const go = eventLink
+      ? () => openEventFromOverview(eventLink, el, { container, rerender, user })
+      : () => window.yuvomi.navigate(el.dataset.route);
     if (el.tagName === 'A') {
       el.addEventListener('click', (e) => {
         // DER BROWSER BEHÄLT SEINEN KLICK. Ein bedingungsloses
@@ -7220,6 +7419,15 @@ export async function render(container, { user, signal: routeSignal = null } = {
     before: container.querySelector('#dashboard-shell'),
     toast: (message, type) => window.yuvomi?.showToast(message, type),
   });
+  // ERSTE SCHRITTE (R23 D14): nach dem Rundgang drei Wege - Familie, Module,
+  // Region - an derselben Stelle wie der Zonen-Hinweis, vom ersten Bild an
+  // (utils/first-steps.js). Den Haken der Mitglieder setzt das Laden.
+  const mountSteps = () => mountFirstSteps(container.querySelector('.dashboard'), {
+    user, t, wall: wallMode,
+    before: container.querySelector('#dashboard-shell'),
+    navigate: (path) => window.yuvomi?.navigate(path),
+  });
+  let firstSteps = mountSteps();
 
   // Ein Neuaufbau AUS DER SEITE HERAUS laeuft nicht durch renderPage() im
   // Router, und damit an dessen FAB-Wechsel vorbei (#634): den alten Knopf aus
@@ -7324,6 +7532,7 @@ export async function render(container, { user, signal: routeSignal = null } = {
     if (signal.aborted) return;
     primeMealTypeNames(prefsRes?.data);
     data         = dashRes;
+    firstSteps.update(Array.isArray(data?.users) ? data.users.length : null);
     /* Die Zahlen an den Nav-Zielen und Modulkacheln kommen aus derselben
      * Antwort (#868). Sie hier hereinzureichen spart die zweite Aggregation,
      * die der Shell-Aufbau sonst beim Anmelden anstiess - `layoutHintQuery`
@@ -8393,8 +8602,19 @@ export async function render(container, { user, signal: routeSignal = null } = {
   // Schluessel bleibt eine ZUSAETZLICHE Bedingung statt zu entfallen: er ist
   // der Weg, mit dem Test-Faelle (document-guards-harness.js) den Dialog
   // gezielt unterdruecken, ohne einen Testnutzer am Server zu markieren.
-  if (user?.onboarding_pending && !localStorage.getItem(ONBOARDING_KEY)) {
-    setTimeout(() => showOnboarding(container, () => maybeHintCustomize(container)), 400);
+  // Aus der Hilfe gewuenscht (router.js, "Rundgang ansehen", R23 S10): einmal,
+  // unabhaengig vom Merker am Konto.
+  let replayTour = false;
+  try { replayTour = sessionStorage.getItem('yuvomi-replay-tour') === '1'; sessionStorage.removeItem('yuvomi-replay-tour'); } catch { /* ohne Speicher kein Rundgang */ }
+  if (replayTour || (user?.onboarding_pending && !localStorage.getItem(ONBOARDING_KEY))) {
+    setTimeout(() => showOnboarding(container, () => {
+      // Nach dem Rundgang keine Sackgasse (R23 D14): die Karte beginnt jetzt -
+      // nicht nach einer Wiederholung aus der Hilfe (der Haushalt laeuft schon).
+      if (!replayTour) startFirstSteps();
+      firstSteps = mountSteps();
+      firstSteps.update(Array.isArray(data?.users) ? data.users.length : null);
+      maybeHintCustomize(container);
+    }), 400);
   } else {
     maybeHintCustomize(container);
   }
@@ -8467,7 +8687,7 @@ export const __test = {
   usableOverviewMemo, overviewMemoKey, overviewSignature, watchOverviewWrites,
   getOverviewMemo: () => _overviewMemo,
   setOverviewMemo: (memo) => { _overviewMemo = memo; },
-  childDefaultFor, taskForOthersOnly, customizeLeaveAllowed, setCustomizeFabHidden, renderCalendarWidget, renderRewardsWidget, loadScheduleSlice, renderUrgentTasks, renderUpcomingEvents, buildTodayHighlights, buildTodayProgram, buildTodayCockpitModel, renderTodayCockpit, renderPinnedNotes, renderScheduleWidget, renderWasteWidget, renderPantryWidget, renderFamilyWidget, formatDueDate, normalizeVisibleMealTypes, renderTodayMeals, calendarEventRoute, eventOccurrenceDateKey, eventStartDate, renderWallSurface, renderWallWho, planWallWhoLines, fitWallWho, createWallFit, rebuildWall, WALL_WHO_LADDER, renderDashboardOverview, selectMetricTiles, METRIC_TILE_ORDER, PROGRAM_ROW_CAP, WALL_ROW_CAP, weatherToneKey, weatherMotionAttr, weatherTempBand, weatherSpanModel, weatherDayLabel, weatherTodayRange, renderWeatherWidget, renderWeatherUnavailable, weatherAvailableFrom, renderWallWeather, relativeDateLabel, listRowCap, calendarRowCap, calendarListRowsOf, renderDashboardSkeleton, openWidgetOptions, renderFab, widgetHeader, renderDashboardLayout, renderMetricTiles, renderGridHint, captureTileRects, playTileFlip, playGridShift, familyManageHref, customizeHasChanges, focusKeyOf, captureRebuildFocus, restoreFocusAfterRebuild, shoppingSoleListRoute, todayMoreRoute, wireTodayMore, wireTodayOverdue, renderWidgetSizeMenu, renderNewPill, renderCustomizeFootnote, applyRowFill, programRowsThatFit, PROGRAM_ROW_CAP_PHONE, createPhoneProgramFit };
+  childDefaultFor, taskForOthersOnly, customizeLeaveAllowed, setCustomizeFabHidden, renderCalendarWidget, renderRewardsWidget, loadScheduleSlice, renderUrgentTasks, renderUpcomingEvents, buildTodayHighlights, buildTodayProgram, buildTodayCockpitModel, renderTodayCockpit, renderPinnedNotes, renderScheduleWidget, renderWasteWidget, renderPantryWidget, renderFamilyWidget, formatDueDate, normalizeVisibleMealTypes, renderTodayMeals, calendarEventRoute, eventOccurrenceDateKey, eventStartDate, renderWallSurface, renderWallWho, planWallWhoLines, fitWallWho, createWallFit, rebuildWall, shedWallProgram, WALL_WHO_LADDER, renderDashboardOverview, selectMetricTiles, METRIC_TILE_ORDER, PROGRAM_ROW_CAP, WALL_ROW_CAP, weatherToneKey, weatherMotionAttr, weatherTempBand, weatherSpanModel, weatherDayLabel, weatherTodayRange, renderWeatherWidget, renderWeatherUnavailable, weatherAvailableFrom, renderWallWeather, relativeDateLabel, listRowCap, calendarRowCap, calendarListRowsOf, renderDashboardSkeleton, openWidgetOptions, renderFab, widgetHeader, renderDashboardLayout, renderMetricTiles, renderGridHint, captureTileRects, playTileFlip, playGridShift, familyManageHref, customizeHasChanges, focusKeyOf, captureRebuildFocus, restoreFocusAfterRebuild, shoppingSoleListRoute, todayMoreRoute, wireTodayMore, wireTodayOverdue, renderWidgetSizeMenu, renderNewPill, renderCustomizeFootnote, applyRowFill, programRowsThatFit, PROGRAM_ROW_CAP_PHONE, createPhoneProgramFit };
 
 // `signal` ist der Controller des Aufbaus, der die Wetterkarte gezeichnet hat
 // (#976/#977). Vorher las diese Funktion das Modul-Feld `_fabController` -

@@ -955,7 +955,11 @@ test('clickedTime: eine Spalte ohne messbare Höhe legt nichts Falsches an', () 
  *
  * Geprüft wird über eachRule() (der EINE Regelscanner), nicht über ein eigenes
  * Regex: das alte Muster war dreimal blind und jedes Mal war der Guard grün. */
-const calendarCss = readFileSync(new URL('../public/styles/calendar.css', import.meta.url), 'utf8');
+// Das Zeitraster (Kopf, Stundenachse, Jetzt-Linie) steht seit R22 (D6) im
+// geteilten Blatt time-grid.css, das calendar.css einbindet - die Regeln des
+// Kalenders sind beide Dateien zusammen.
+const calendarCss = readFileSync(new URL('../public/styles/calendar.css', import.meta.url), 'utf8')
+  + '\n' + readFileSync(new URL('../public/styles/time-grid.css', import.meta.url), 'utf8');
 
 test('Wochenraster: Kopf, Ganztagszeile und Stunden verwenden dieselbe Zeitspaltenbreite', () => {
   const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
@@ -1139,7 +1143,7 @@ test('ohne Cursor bleibt es bei heute', () => {
   assert(newEventDate('day', '', TODAY) === TODAY, 'leerer Cursor fällt auf heute zurück');
 });
 
-test('jedes „+" ohne angeklickten Tag reicht ein Datum durch (nur die Suche nicht)', () => {
+test('jedes „+" ohne angeklickten Tag reicht ein Datum durch', () => {
   const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/.*$/gm, '');
@@ -1147,11 +1151,12 @@ test('jedes „+" ohne angeklickten Tag reicht ein Datum durch (nur die Suche ni
   // deckt der Guard N Fundstellen ab statt der Regel, und ein neuer Knopf fiele
   // still durch.
   const creates = src.match(/openEventModal\(\{\s*mode:\s*'create'[^)]*\)/g) || [];
-  assert(creates.length >= 5, `zu wenige create-Aufrufe gefunden (${creates.length}) - Regex greift nicht mehr`);
+  assert(creates.length >= 4, `zu wenige create-Aufrufe gefunden (${creates.length}) - Regex greift nicht mehr`);
+  // Der einzige Weg ohne Datum war der Knopf im Leerzustand der Suche; seit R23
+  // zeigt die leere Suche den geteilten Baustein ohne zweiten Anlegeknopf.
   const withoutDate = creates.filter((call) => !/\bdate:/.test(call));
-  assert(withoutDate.length === 1,
-    `genau ein „+" darf ohne Datum öffnen (der Leerzustand der Suche, dort steht kein Zeitraum `
-    + `auf dem Schirm), gefunden: ${withoutDate.length} - ${withoutDate.join(' | ')}`);
+  assert(withoutDate.length === 0,
+    `jedes „+" oeffnet mit Datum, gefunden ohne: ${withoutDate.length} - ${withoutDate.join(' | ')}`);
 });
 
 // --------------------------------------------------------
@@ -1731,6 +1736,92 @@ test('matchesRRuleByday filtert nicht, wo UTC- und Ortsdatum auseinanderfallen',
   assert(matchesRRuleByday('2026-02-01', R) === false, 'ohne Zonenhinweis wird gefiltert');
   assert(matchesRRuleByday('2026-02-01', R, { utcDiffersFromLocal: true }) === true,
     'mit Zonenhinweis nicht - lieber ein Vorkommen zu viel als eines lautlos verloren');
+});
+
+// R22 (Critique a3 P1, D5): in der Woche stand vom Etikett 0 px ("10:00 -
+// 10:00 +1 · 2..."), im Monat war jede Schicht eine Terminzeile und schob die
+// Termine hinter "+4 weitere". Woche/Tag: "F · LJ" vor der Uhrzeit, der volle
+// Text im Namen. Monat: Striche am Tageskopf, hoechstens drei und "+N".
+test('R22 D5: Woche/Tag nennen "F · LJ" vor der Uhrzeit, der Monat zeigt Striche statt Zeilen', () => {
+  const { renderScheduleChip, renderMonthDay, state } = calendarHelpers;
+  const saved = { users: state.users, userDirectory: state.userDirectory, scheduleEntries: state.scheduleEntries, layerSchedule: state.layerSchedule, people: state.people, assignedToMe: state.assignedToMe, events: state.events, tasks: state.tasks };
+  const type = (code, color) => ({ name: `${code}-Schicht`, short_code: code, color, start_time: '06:00', end_time: '14:00' });
+  try {
+    state.users = [{ id: 1, display_name: 'Linda Johnson' }, { id: 2, display_name: 'Alex Johnson' }];
+    state.userDirectory = state.users;
+    const entry = { user_id: 1, date_key: '2026-10-21', source: 'pattern', pattern_day_id: 4, shift_type: type('F', '#0891b2') };
+    const chip = renderScheduleChip(entry, 'allday-holiday', { showFullRange: true, clickable: true });
+    assert(/<span class="schedule-entry__label">F · LJ<\/span><small class="schedule-entry__start">/.test(chip), `Kuerzel und Initialen VOR der Uhrzeit: ${chip}`);
+    assert(/aria-label="F-Schicht · Linda Johnson · /.test(chip), 'der volle Text ist der Name des Chips');
+    const agenda = renderScheduleChip(entry, 'agenda-holiday');
+    assert(agenda.includes('F · Linda Johnson'), 'die Agenda nennt die Person ausgeschrieben');
+
+    state.layerSchedule = true;
+    state.people = new Set();
+    state.assignedToMe = false;
+    state.scheduleEntries = [
+      entry,
+      { ...entry, user_id: 2, source: 'extra', extra_id: 1, shift_type: type('B', '#d97706') },
+      { ...entry, user_id: 2, pattern_day_id: 5, shift_type: type('N', '#3b82f6') },
+      { ...entry, source: 'extra', extra_id: 2, shift_type: type('B', '#d97706') },
+    ];
+    const cell = renderMonthDay('2026-10-21', true, { focusable: true });
+    assert(!/month-day__holiday schedule-entry/.test(cell), 'keine Schicht als Zeile in der Monatszelle');
+    assert((cell.match(/class="month-day__shift"/g) || []).length === 3, 'hoechstens drei Striche');
+    assert(/class="month-day__shifts-more">\+1</.test(cell), 'der Rest als +N');
+    // Der Bezugsrahmen der Striche haengt an einer Klasse, nicht an `:has()`
+    // (S10): die Mindestversion Chrome 87 verwirft jede `:has()`-Regel, und
+    // die absoluten Striche aller Zellen stuenden an derselben Ecke.
+    assert(/class="month-day[^"]*\bmonth-day--shifts\b/.test(cell), 'die Zelle mit Schichten traegt month-day--shifts');
+    const shiftsBox = [...eachRule(calendarCss)].find((r) => /\.month-day__shifts\b/.test(r.selector) && /position:\s*absolute/.test(r.body));
+    assert(shiftsBox, 'die Striche stehen absolut in der Zelle');
+    const frame = [...eachRule(calendarCss)].find((r) => /position:\s*relative/.test(r.body) && /\.month-day--shifts\b/.test(r.selector));
+    assert(frame && !/:has\(/.test(frame.selector) && !frame.at.length, `den Rahmen gibt eine Regel ohne :has() und ohne Bedingung: ${frame?.selector}`);
+    state.scheduleEntries = [];
+    assert(!/month-day--shifts/.test(renderMonthDay('2026-10-21', true, { focusable: true })), 'ohne Schicht keine Klasse');
+    assert(/data-total="0"/.test(cell), '"+N weitere" zaehlt nur Termine, Aufgaben und Feiertage');
+    assert(/4 /.test(cell.match(/month-day__label">([^<]*)/)?.[1] ?? '') || /monthDayEntries/.test(cell), 'der Name der Zelle zaehlt die Schichten weiter');
+  } finally {
+    Object.assign(state, saved);
+  }
+});
+
+// R22 S10 (a3 Klein): bei 1280 endeten 28 von 40 Monatstiteln in der Ellipse,
+// die Serienmarke nahm jedem 18px. Unter 9rem Balkenbreite weicht nur sie; das
+// gewaehlte Terminicon bleibt (gemessen 28 -> 9, ab 1440 unveraendert).
+test('R22 S10: im schmalen Monatsbalken weicht die Serienmarke dem Titel, nicht das Terminicon', () => {
+  const rules = [...eachRule(calendarCss)];
+  const desk = (r) => r.at.some((a) => /min-width:\s*1024px/.test(a));
+  const box = rules.find((r) => desk(r) && /\.month-day__event\s*$/.test(r.selector.trim()) && /container:\s*month-chip\s*\/\s*inline-size/.test(r.body));
+  assert(box, 'der Monatsbalken ist ab 1024px ein Container namens month-chip');
+  const hide = rules.find((r) => desk(r) && r.at.some((a) => /@container\s+month-chip\s*\(max-width:\s*9rem\)/.test(a)) && /display:\s*none/.test(r.body));
+  assert(hide, 'unter 9rem gibt es eine Regel, die etwas ausblendet');
+  assert(/\.calendar-repeat-icon/.test(hide.selector) && !/event-icon/.test(hide.selector), `nur die Serienmarke weicht: ${hide.selector}`);
+});
+
+// R22 (Critique a1 Klein, D20): eingeklappt nannte der Telefonkopf nur den
+// Zeitraum und die Ansicht - kein Wort, wo man ist (DESIGN.md "Nie ein Kopf
+// ohne Ortsangabe"). Und der Stepper fiel beim Andocken von 48 auf 24px, die
+// Zeile sprang (Agenda-Scroll-CLS, handoff-2).
+test('R22 D20: der angedockte Telefonkopf nennt den Ort, der Stepper behaelt seine Hoehe', () => {
+  const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
+  const bar = src.slice(src.indexOf('function toolbarHtml('), src.indexOf('function toolbarHtml(') + 2400);
+  assert(/<div class="cal-toolbar__stepper"><span class="cal-toolbar__place" aria-hidden="true">\$\{esc\(t\('calendar\.title'\)\)\}<\/span>/.test(bar), 'der Ort steht im Stepper, fuer Hilfstechnik bleibt das <h1>');
+  const phone = [...eachRule(calendarCss)].filter((r) => r.at.some((a) => /max-width:\s*639px/.test(a)));
+  const collapsedPlace = phone.find((r) => r.selector.trim() === '.page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__place');
+  assert(/display:\s*block/.test(collapsedPlace?.body ?? ''), 'eingeklappt steht der Ort sichtbar ueber dem Zeitraum');
+  const base = [...eachRule(calendarCss)].find((r) => !r.at.length && r.selector.trim() === '.cal-toolbar__place');
+  assert(/display:\s*none/.test(base?.body ?? ''), 'ausgeklappt und am Desktop nennt der Titel den Ort');
+  const stepper = phone.find((r) => r.selector.trim() === '.cal-toolbar__stepper');
+  assert(/min-height:\s*var\(--target-base\)/.test(stepper?.body ?? ''), 'der Stepper bleibt beim Andocken 48px hoch (vorher 48 -> 24)');
+  // S10: zwischen 640 und 1023px nannte der angedockte Kopf den Ort nicht. Der
+  // Stepper loest sich dort auf; der Zeitraum-Slot stellt die Caption in die
+  // Spalte des Labels, darueber, ohne dass die Zeile waechst.
+  const tablet = [...eachRule(calendarCss)].filter((r) => r.at.some((a) => /min-width:\s*640px\)\s*and\s*\(max-width:\s*1023px/.test(a)));
+  const tabletPlace = tablet.find((r) => r.selector.trim() === '.page-toolbar--period-title.cal-toolbar.page-toolbar--capped.is-collapsed .cal-toolbar__place');
+  assert(/display:\s*block/.test(tabletPlace?.body ?? '') && /grid-area:\s*1\s*\/\s*2/.test(tabletPlace?.body ?? ''), 'am Tablet steht der Ort angedockt ueber dem Zeitraum');
+  const tabletLabel = tablet.find((r) => /is-collapsed .cal-toolbar__stepper > .cal-toolbar__label$/.test(r.selector.trim()));
+  assert(/grid-area:\s*2\s*\/\s*2/.test(tabletLabel?.body ?? ''), 'der Zeitraum steht darunter in derselben Spalte');
 });
 
 test('scheduleEntriesOnDay() respektiert den Personenfilter und den "Mir zugewiesen"-Filter wie Termine/Aufgaben (#1018)', () => {
@@ -3216,9 +3307,12 @@ function fakeAgendaContainer() {
   const container = fakeContainer();
   // Seit R10 (L5) steht die Agenda in Liste + Detail: `.calendar-agenda-split`
   // gibt es im Textstub nicht, der Baustein haengt sich dann nicht ein.
+  // Seit R23 S11 setzt die Agenda ihre Tage IN die Liste (`#agenda-view`,
+  // utils/row-fill.js): der Stub haengt sie an denselben Text.
+  const list = { ...fakeDomElement(), insertAdjacentHTML: (pos, chunk) => container.insertAdjacentHTML(pos, chunk), isConnected: false };
   return {
     ...container,
-    querySelector: (sel) => (sel === '.calendar-agenda-split' ? null : container.querySelector(sel)),
+    querySelector: (sel) => (sel === '.calendar-agenda-split' ? null : sel === '#agenda-view' ? list : container.querySelector(sel)),
     querySelectorAll: () => [],
     get html() { return container.html; },
   };
@@ -3941,7 +4035,8 @@ test('Stundenleiste: volle Stunden, im 12-Stunden-Format ohne „:00"', () => {
   assert(calendarHelpers.compactHourLabel('08.00') === '08.00', 'die Locale-Schreibweise (id) bleibt unveraendert');
   // Und die Stundenleiste benutzt sie - in Woche UND Tag.
   const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
-  const uses = src.match(/<span class="week-view__time-label">\$\{h === 0 \? '' : hourGutterLabel\(h\)\}<\/span>/g) ?? [];
+  // Die Achse baut das geteilte Zeitraster (utils/time-grid.js) aus genau dieser Beschriftung.
+  const uses = src.match(/timeGridHoursHtml\(hourGutterLabel\)/g) ?? [];
   assert(uses.length === 2, `Woche und Tag muessen hourGutterLabel verwenden, gefunden: ${uses.length}`);
 });
 
@@ -6088,8 +6183,14 @@ await test('Re-Kritik: Personen-Chips ohne geteilten Nachnamen; heute ist im Min
   assert(!/background-color/.test(cursor?.body ?? ''), 'der gewaehlte Tag ist keine zweite Scheibe');
   const mini = rules.filter((r) => r.selector.includes('.cal-mini__day'));
   assert(mini.every((r) => !/--module-accent/.test(r.body)), 'kein Azur im Mini-Monat');
-  const hover = rules.find((r) => r.selector.split(',').some((x) => x.trim() === '.week-view__col:hover'));
-  assert(/var\(--color-accent\)/.test(hover?.body ?? '') && !/--module-accent/.test(hover?.body ?? ''), 'die Spalte unter dem Zeiger im Akzent');
+  // R22 (D20): getoent wird das Band unter dem Zeiger, nicht die Spalte.
+  const hover = rules.find((r) => r.selector.trim() === '.cal-hover-slot');
+  assert(/var\(--color-accent\)/.test(hover?.body ?? '') && !/--module-accent/.test(hover?.body ?? ''), 'das Band unter dem Zeiger im Akzent');
+  assert(!rules.some((r) => r.selector.split(',').some((x) => /^\.(?:week|day)-view__col:hover$/.test(x.trim()))), 'keine Spalte toent sich als Ganzes');
+  const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
+  const wire = src.slice(src.indexOf('function wireTimeGridCreate('), src.indexOf('function scrollToHour('));
+  assert(/band\.className = 'cal-hover-slot'/.test(wire) && /matchMedia\('\(hover: hover\) and \(pointer: fine\)'\)/.test(wire), 'das Band entsteht nur mit echtem Zeiger');
+  assert(/const slot = e \? slotAt\(e\) : null;[\s\S]*?const \[hour, minute\] = slot\.time\.split/.test(wire), 'das Band steht auf der Zeit, die ein Doppelklick anlegt');
 });
 
 test('Seitenleiste: der Mini-Monat zeigt sechs Wochen ab dem Wochenstart, markiert heute, Auswahl und den gezeigten Zeitraum', () => {
@@ -6281,7 +6382,8 @@ test('R19 Popover und Tageskopf: Spanne bricht nicht, Ort nicht im Wort, ein Kop
   const wrap = rules.find((r) => r.selector.trim() === '.detail-row:has(> .detail-row__action)');
   assert(/flex-wrap:\s*wrap/.test(wrap?.body ?? ''), 'die Aktion einer Zeile rueckt bei Platzmangel darunter');
   const text = rules.find((r) => r.selector.trim() === '.detail-row:has(> .detail-row__action) > .detail-row__text');
-  assert(/flex:\s*1 1 10rem/.test(text?.body ?? ''), 'der Wert beansprucht seine Mindestbreite');
+  // R23: 8rem statt 10rem - mit 10rem passte die Aktion am Telefon nie daneben.
+  assert(/flex:\s*1 1 8rem/.test(text?.body ?? ''), 'der Wert beansprucht seine Mindestbreite');
 });
 
 // R20 (E1-Befund, Kalender 1920 CLS 0,136): die Spalte der Seitenleiste steht
@@ -6691,6 +6793,62 @@ test('R21 S7: das Zeitraum-Label nimmt die kuerzere Fassung, bevor es kappt', ()
   assert(/to: formatDayMonth\(span\.to\)/.test(src), 'die kurze Spanne nennt das Ende ohne Jahr');
 });
 
+/* R22-F (F1 Punkt 5): der Aufbau des Kalenders (Monat, Woche) lag bei 4x CPU
+ * mobil bei 150 ms LoAF, knapp die Haelfte erzwungenes Stil-/Layout aus vielen
+ * kleinen Lese-nach-Schreib-Wechseln. Drei davon gehoerten dem Kalender allein:
+ * das Zeitraum-Label mass auch, wo es keine kuerzere Fassung gibt, die
+ * Seitenleiste fragte am Telefon ihre Container-Abfrage ab, und die frisch
+ * gebaute Tagesliste des Monats wurde auf scrollTop 0 gesetzt (14 ms Layout).
+ * Am Aufrufer gemessen: kein Lesezugriff mehr, wo nichts zu entscheiden ist. */
+await test('R22-F: der Kalenderaufbau liest kein Layout, wo es nichts zu entscheiden gibt', async () => {
+  const s = calendarHelpers.state;
+  const prev = { view: s.view, cursor: s.cursor, today: s.today };
+  const prevWindow = globalThis.window;
+  const prevGcs = globalThis.getComputedStyle;
+  let restoreDom = null;
+  try {
+    // Monat: keine kuerzere Fassung, also keine Messung.
+    globalThis.window = { ...(prevWindow ?? {}), matchMedia: () => ({ matches: false }) };
+    s.today = '2026-10-21';
+    s.cursor = '2026-10-21';
+    s.view = 'month';
+    let reads = 0;
+    const lbl = { textContent: 'Oktober 2026', get clientWidth() { reads += 1; return 100; }, get scrollWidth() { reads += 1; return 140; } };
+    calendarHelpers.fitPeriodLabel(lbl);
+    assert(reads === 0, `das Monatslabel misst nichts (${reads} Lesezugriffe)`);
+
+    // Seitenleiste: unter 86.25rem Fensterbreite steht sie nie - kein getComputedStyle.
+    let styleReads = 0;
+    globalThis.getComputedStyle = () => { styleReads += 1; return { display: 'flex' }; };
+    assert(calendarHelpers.sidebarShown({ hidden: false }) === false, 'am Telefon keine Seitenleiste');
+    assert(styleReads === 0, 'ohne die Container-Abfrage aufzuloesen');
+    globalThis.window = { ...(prevWindow ?? {}), matchMedia: () => ({ matches: true }) };
+    assert(calendarHelpers.sidebarShown({ hidden: false }) === true, 'breit entscheidet weiter die Box');
+
+    // Die frisch gebaute Tagesliste steht oben - kein scrollTop-Setzen.
+    restoreDom = installMiniDom();
+    let scrollWrites = 0;
+    const node = () => ({ classList: { toggle() {} }, setAttribute() {}, replaceChildren() {}, insertAdjacentHTML() {} });
+    const open = node();
+    const rows = { ...node(), set scrollTop(v) { scrollWrites += 1; }, get scrollTop() { return 0; } };
+    const list = { querySelector: (sel) => (sel === '#month-open-day' ? open : sel === '#month-list-rows' ? rows : null) };
+    calendarHelpers.renderMonthList(list, { fresh: true });
+    assert(scrollWrites === 0, 'eine eben gebaute Liste wird nicht zurueckgesetzt');
+    calendarHelpers.renderMonthList(list);
+    assert(scrollWrites === 1, 'ein anderer Tag in derselben Liste setzt zurueck');
+  } finally {
+    Object.assign(s, prev);
+    globalThis.window = prevWindow;
+    globalThis.getComputedStyle = prevGcs;
+    restoreDom?.();
+  }
+  const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
+  assert(/renderMonthList\(list, \{ fresh: true \}\);/.test(src), 'wireMonthList baut die Liste als frisch');
+  const bar = src.slice(src.indexOf('function renderToolbar()'), src.indexOf('function renderToolbar()') + 4000);
+  assert(/if \(builtToolbars\.get\(bar\) === html && bar\.querySelector\('#cal-label'\)\) \{\n    updateLabel\(\);\n    return;/.test(bar),
+    'derselbe Kopf wird nicht zweimal gebaut, nur der Zeitraum nachgefuehrt');
+});
+
 /* R21 S7 (D9): die kompakte eine Zeile - Suche als Icon, Verwalten im Filterblatt. */
 test('R21 S7: die kompakte Kopfzeile faltet Suche und Verwalten, die offene Suche nimmt den Platz der Ansichtswahl', () => {
   const rules = [...eachRule(calendarCss)].filter((r) => r.at.some((a) => /min-width:\s*1024px/.test(a))
@@ -6705,6 +6863,45 @@ test('R21 S7: die kompakte Kopfzeile faltet Suche und Verwalten, die offene Such
     'mit Fokus und mit Begriff weicht die Ansichtswahl - die Zeile bricht nicht um');
   const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
   assert(/data-filter-manage-calendars/.test(src), 'Verwalten steht im Filterblatt');
+});
+
+/* R22-F (F1 Punkt 6): ohne `:has()` fiel jede Icon-Form-Regel oben als Ganzes
+ * weg (`:not(:has(...))` ist kein vergebender Selektor) - die kompakte Suche
+ * blieb ein Feld. Gemessen 1280 mit nachgestelltem Browser ohne `:has()`
+ * (Regeln mit `:has()` entfernt, `@supports not selector(:has(*))` aktiv):
+ * 70x40 Feld -> 40x40 Lupe. Die Rueckfallform liest den Stand "Begriff steht"
+ * aus der Klasse `is-filled`, die utils/page-search.js nachhaelt. */
+await test('R22-F: die kompakte Kalendersuche wird auch ohne :has() zur Lupe', async () => {
+  const fallback = [...eachRule(calendarCss)].filter((r) => r.at.some((a) => /^@supports not selector\(:has\(\*\)\)/.test(a.trim())));
+  const icon = fallback.find((r) => /label\.page-search:not\(:focus-within\):not\(\.is-filled\)$/.test(r.selector.trim())
+    && !r.at.some((a) => /hover/.test(a)));
+  assert(icon && /width:\s*var\(--target-base\)/.test(icon.body) && /border-radius:\s*var\(--radius-full\)/.test(icon.body),
+    'ohne :has() steht die Suche als Lupe in Zielgroesse');
+  assert(icon.at.some((a) => /min-width:\s*1024px/.test(a)), 'im selben Rahmen wie die Regel mit :has()');
+  const pointer = fallback.find((r) => /label\.page-search:not\(:focus-within\):not\(\.is-filled\)$/.test(r.selector.trim())
+    && r.at.some((a) => /hover/.test(a)));
+  assert(pointer && /width:\s*var\(--target-md\)/.test(pointer.body), 'am Zeiger misst sie wie ihre Zeile (D8)');
+  assert(fallback.every((r) => !/:has\(/.test(r.selector)), 'der Rueckfall selbst kommt ohne :has() aus');
+
+  // Der Stand kommt aus dem Feld: Markup mit Wert und jede Eingabe.
+  const { renderPageSearch, wirePageSearch } = await import('../public/utils/page-search.js');
+  assert(/class="page-search cal-toolbar__search is-filled"/.test(renderPageSearch({ id: 's', label: 'Suchen', value: 'Arzt', className: 'cal-toolbar__search' })),
+    'ein Begriff aus der Adresse steht schon im ersten Markup');
+  assert(!/is-filled/.test(renderPageSearch({ id: 's', label: 'Suchen', className: 'cal-toolbar__search' })), 'leer ohne Klasse');
+  const classes = new Set();
+  const root = { classList: { toggle: (c, on) => (on ? classes.add(c) : classes.delete(c)) } };
+  const listeners = {};
+  const input = {
+    value: '',
+    closest: (sel) => (sel === '.page-search__control' ? null : sel === '.page-search' ? root : null),
+    addEventListener: (type, fn) => { listeners[type] = fn; },
+  };
+  const handle = wirePageSearch({ querySelector: () => input }, { id: 's', onQuery: () => {}, delay: 0 });
+  input.value = 'Zahnarzt';
+  listeners.input();
+  assert(classes.has('is-filled'), 'eine Eingabe setzt den Stand');
+  handle.clear();
+  assert(!classes.has('is-filled'), 'Leeren nimmt ihn zurueck');
 });
 
 /* R21 S7 (a3): bei 1920 doppelte der Mini-Monat neben dem Monat das Raster. */
@@ -6737,6 +6934,73 @@ test('R21 S9b: Monatschip und Monatsband teilen ein Polster von mindestens 3px',
   }
   assert(/--month-band-h:\s*calc\(var\(--text-xs\) \* 1\.4 \+ 2 \* var\(--cal-chip-pad-block\)\)/.test(body('.month-grid')),
     'die Spur der Monatsbaender rechnet nicht mit dem Polster des Chips');
+});
+
+// R23 (Critique G1 P3 "doppelte Kalender-Steuerung ab 1920"): neben der
+// Seitenleiste fuehrte das Filterblatt Personen und Kalender ein zweites Mal,
+// und sein Zaehler zaehlte sie mit. Eine Achse, ein Ort je Breite.
+test('R23: steht die Seitenleiste, traegt das Filterblatt nur Ebenen und Anzeige', () => {
+  const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
+  const fnOf = (name) => { const at = src.indexOf(`function ${name}(`); return src.slice(at, src.indexOf('\n}\n', at)); };
+  assert(/return sidebarShown\(_container\?\.querySelector\('#cal-sidebar'\)\);/.test(fnOf('railCarriesFilters')), 'die Frage ist dieselbe wie die der Leiste');
+  const sheet = fnOf('openCalendarFilters');
+  assert(/const rail = railCarriesFilters\(\);/.test(sheet), 'das Blatt fragt die Leiste');
+  assert(/if \(!rail && \(meRow \|\| peopleChips\)\) groups\.push\(\{ heading: t\('calendar\.filtersPeople'\)/.test(sheet), 'Personen nur ohne Leiste');
+  assert(/if \(!rail && \(sourceRows \|\| manageRow\)\) groups\.push\(\{ heading: t\('calendar\.filtersSources'\)/.test(sheet), 'Kalender nur ohne Leiste');
+  assert(/if \(!rail\) \{\s*state\.assignedToMe = false;\s*state\.people\.clear\(\);/.test(sheet), 'Zuruecksetzen laesst die Achsen der Leiste stehen');
+  const count = fnOf('activeFilterCount');
+  for (const axis of ['state.assignedToMe', 'state.people.size > 0', 'state.hiddenSources?.size > 0']) {
+    assert(count.includes(`if (!rail && ${axis})`), `der Zaehler zaehlt ${axis} nur ohne Leiste`);
+  }
+  assert(/if \(!first\) renderToolbar\(\);/.test(fnOf('wireSidebar')), 'erscheint oder geht die Leiste, zaehlt der Knopf neu');
+});
+
+// R23 (Critique G1 P3 "Maps eigene Zeile mobil"): mit 10rem stand "In Maps
+// oeffnen" auf dem Telefon nie neben dem Ort.
+test('R23: die Folgeaktion einer Detailzeile passt am Telefon neben ihren Wert', () => {
+  const css = readFileSync(new URL('../public/styles/detail-view.css', import.meta.url), 'utf8');
+  const rule = [...eachRule(css)].find((r) => r.selector.trim() === '.detail-row:has(> .detail-row__action) > .detail-row__text');
+  assert(/flex:\s*1 1 8rem/.test(rule?.body ?? ''), `Basis 8rem, nicht 10rem (${rule?.body})`);
+});
+
+// R23 S11 (optimize): der Wechsel in die Agenda hielt das alte Bild 205 ms
+// (1440, 4x CPU) - 31 Tage Markup fuer ein Bild, das fuenf zeigt. Die Tage
+// ausser Sicht kommen in Happen (utils/row-fill.js), ihr Platzhalter hat
+// dieselbe Schaetzhoehe wie `content-visibility`. Ein Neuzeichnen IN der
+// Agenda und ein Sprungziel (`?open=`) zeichnen ganz.
+test('R23: die Agenda zeichnet beim Wechsel erst die Tage im Bild, der Platzhalter misst wie content-visibility', () => {
+  const src = readFileSync(new URL('../public/pages/calendar.js', import.meta.url), 'utf8');
+  const fnOf = (name) => { const at = src.indexOf(`function ${name}(`); return src.slice(at, src.indexOf('\n}\n', at)); };
+  const view = fnOf('renderAgendaView');
+  assert(/beginRowFill\(agenda, \{ progressive: agendaFillWanted\(\) \}\)/.test(view), 'die Agenda baut ueber beginRowFill');
+  assert(/fill\.rows\(groups, agendaDayHtml\)/.test(view) && /fill\.start\(\{ onRows: drawRowIcons \}\)/.test(view),
+    'Einheit ist der Tag, nachkommende Tage bekommen ihre Zeichen');
+  const wanted = fnOf('agendaFillWanted');
+  assert(/_renderedView === 'agenda'\) return false/.test(wanted), 'ein Neuzeichnen in der Agenda zeichnet ganz');
+  assert(/get\('open'\)/.test(wanted), 'ein Sprungziel zeichnet ganz');
+  assert(/_renderedView = state\.view;/.test(fnOf('renderView')), 'renderView merkt sich die gezeichnete Ansicht');
+  assert(/_renderedView = null;/.test(src.slice(src.indexOf('export async function render('), src.indexOf('bindPageListeners();', src.indexOf('export async function render(')))),
+    'jeder Seitenaufbau beginnt ohne gezeichnete Ansicht');
+  const css = readFileSync(new URL('../public/styles/calendar.css', import.meta.url), 'utf8');
+  const rules = [...eachRule(css)];
+  const cv = rules.find((r) => r.selector.trim() === '.agenda-day + .agenda-day' && /content-visibility/.test(r.body));
+  const ph = rules.find((r) => r.selector.trim() === '.agenda-view > .row-pending');
+  assert(/contain-intrinsic-size:\s*auto none auto var\(--agenda-day-estimate\)/.test(cv?.body ?? ''), `content-visibility liest die Schaetzhoehe (${cv?.body})`);
+  assert(/block-size:\s*var\(--agenda-day-estimate\)/.test(ph?.body ?? ''), `der Platzhalter liest dieselbe (${ph?.body})`);
+});
+
+// R23 S11: ein Intl.DateTimeFormat je Sprache und Jahresform, nicht je Tag.
+test('R23: dayHeading baut seinen Formatierer einmal', () => {
+  const Real = Intl.DateTimeFormat;
+  let built = 0;
+  Intl.DateTimeFormat = function (...args) { built += 1; return new Real(...args); };
+  try {
+    const today = headToday();
+    for (let i = 2; i < 40; i++) dayHeading(headAddDays(today, i));
+  } finally {
+    Intl.DateTimeFormat = Real;
+  }
+  assert(built <= 2, `38 Tage, ${built} Formatierer`);
 });
 
 // --------------------------------------------------------

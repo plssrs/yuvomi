@@ -1101,9 +1101,11 @@ test('#1454: die Geburtstagszeile sagt Wochentag, Tag+Monat oder Datum mit Jahr'
     ], '1x2', 4);
     assert.deepEqual(metaOf(html, 'birthday-widget-item__meta'), [
       'common.today',
-      `${wd('2026-09-26')} · dashboard.daysLeft{"count":3}`,
-      'DM:2026-10-15 · dashboard.daysLeft{"count":22}',
-      '2027-01-05 · dashboard.daysLeft{"count":104}',
+      // R23 (D11): der Abstand wie im Geburtstagsmodul ("in 3 Tagen", jenseits
+      // eines Monats grob), nicht "3 Tage" wie eine Dauer.
+      `${wd('2026-09-26')} · in 3 Tagen`,
+      'DM:2026-10-15 · in 22 Tagen',
+      '2027-01-05 · in 3 Monaten',
     ]);
   });
 });
@@ -1149,7 +1151,8 @@ test('#1454: der letzte Besuch liest rueckwaerts, ohne Jahr', () => {
       const note = (lastVisit) => __test.selectMetricTiles({ health, housekeeping: hk(lastVisit) }, 'EUR')
         .find((tile) => tile.id === 'housekeeping').note;
       assert.equal(note('2026-09-22T07:00:00.000Z'), 'dashboard.housekeepingLastVisit{"date":"common.yesterday"}');
-      assert.equal(note('2026-09-10T07:00:00.000Z'), 'dashboard.housekeepingLastVisit{"date":"DM:2026-09-10T07:00:00.000Z"}');
+      // Seit R23 S11 ueber dateText: der Tag der Haushaltszone, dann ohne Jahr.
+      assert.equal(note('2026-09-10T07:00:00.000Z'), 'dashboard.housekeepingLastVisit{"date":"DM:2026-09-10"}');
       const widget = __test.renderHousekeepingWidget(hk('2026-09-22T07:00:00.000Z'), 'EUR');
       assert.match(widget, /dashboard\.housekeepingLastVisit\{"date":"common\.yesterday"\}/,
         'Kachel und Widget sagen dasselbe');
@@ -1636,4 +1639,20 @@ test('R21 Rueckweg: die stille Nachfrage holt jeden eigenen Slice neu, bevor sie
     assert.ok(carry > reload, `${slice}: der Slice wird uebernommen, bevor er neu geholt ist`);
     assert.ok(stamp > carry, `${slice}: der Stand wird neu gestempelt, bevor der Slice neu ist`);
   }
+});
+
+// R22 S9 (Critique 2026-10-22, a1 Klein): Schritt 2 trug den Lucide-Ortungspfeil
+// (`navigation`) zu einem Text ueber Leiste und Module, Schritt 3 versprach das
+// Wischen fuer alle Listeneintraege - es gibt es in Aufgaben, Einkauf, Vorrat.
+test('R22: der Rundgang zeigt in Schritt 2 Module und verspricht das Wischen nur, wo es geht', async () => {
+  const { readFileSync } = await import('node:fs');
+  const dashboard = readFileSync(new URL('../public/pages/dashboard.js', import.meta.url), 'utf8');
+  const steps = dashboard.slice(dashboard.indexOf('function getOnboardingSteps'), dashboard.indexOf('function showOnboarding'));
+  assert.match(steps, /icon: 'layout-grid',\s+title: t\('onboarding\.step2Title'\)/);
+  assert.doesNotMatch(steps, /icon: 'navigation'/, 'kein Ortungspfeil');
+  const de = JSON.parse(readFileSync(new URL('../public/locales/de.json', import.meta.url), 'utf8')).onboarding.step3Body;
+  assert.match(de, /In Aufgaben, Einkauf und Vorrat wischst du/);
+  assert.doesNotMatch(de, /Wische Listeneinträge/);
+  const en = JSON.parse(readFileSync(new URL('../public/locales/en.json', import.meta.url), 'utf8')).onboarding.step3Body;
+  assert.match(en, /In Tasks, Shopping and Pantry/);
 });

@@ -286,6 +286,45 @@ export function authPaths() {
         },
       }),
     },
+    '/api/v1/auth/reset-password/check': {
+      post: op({
+        summary: 'Check a password-reset token without using it',
+        tag: 'Auth',
+        auth: false,
+        description: 'Public bootstrap endpoint for the /reset-password page. Shares the rate limit of POST /reset-password and never consumes the token. Unknown, expired and already used tokens, and tokens of an account that can no longer reset its password, all return valid: false, so the endpoint reveals nothing beyond whether the token can still be used. The token travels in the body, not the URL, so it stays out of access logs.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['token'],
+                properties: { token: { type: 'string' } },
+              },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: 'Whether the token can still set a new password.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: {
+                      type: 'object',
+                      properties: { valid: { type: 'boolean' } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          500: { $ref: '#/components/responses/InternalServerError' },
+        },
+      }),
+    },
     '/api/v1/auth/invites': {
       get: op({
         summary: 'List pending invitations',
@@ -364,7 +403,7 @@ export function authPaths() {
         summary: 'Accept an invitation and create the account',
         tag: 'Auth',
         auth: false,
-        description: 'Public endpoint, rate-limited, no CSRF: the token is the secret. Role and family role come from the invitation and cannot be raised through the request body. A new account with `family_role: child` that is not an administrator starts with the child defaults as member overrides: `budget` none, `housekeeping` read, the capabilities `health_use_fasting` and `housekeeping_view_amounts` none - only where the role profile is not already stricter. Existing accounts and a later change of the family role keep their rights. No session is established; the client redirects to the login page.',
+        description: 'Public endpoint, rate-limited, no CSRF: the token is the secret. Role and family role come from the invitation and cannot be raised through the request body. A new account with `family_role: child` that is not an administrator starts with the child defaults as member overrides: `budget` none, `housekeeping` and `waste` read, the capabilities `health_use_fasting`, `housekeeping_view_amounts`, `calendar_edit_others`, `notes_edit_others`, `inventory_edit_others`, `inventory_view_prices` and `tasks_reorder_family` none - only where the role profile is not already stricter. Existing accounts and a later change of the family role keep their rights. No session is established; the client redirects to the login page.',
         requestBody: jsonBody('#/components/schemas/InviteAcceptRequest'),
         responses: {
           201: { description: 'Account created.' },
@@ -510,7 +549,7 @@ export function authPaths() {
       post: op({
         summary: 'Create user',
         tag: 'Auth',
-        description: 'A new account with `family_role: child` that is not an administrator starts with the child defaults as member overrides: `budget` none, `housekeeping` read, the capabilities `health_use_fasting` and `housekeeping_view_amounts` none - only where the role profile is not already stricter. Existing accounts and a later change of the family role keep their rights.',
+        description: 'A new account with `family_role: child` that is not an administrator starts with the child defaults as member overrides: `budget` none, `housekeeping` and `waste` read, the capabilities `health_use_fasting`, `housekeeping_view_amounts`, `calendar_edit_others`, `notes_edit_others`, `inventory_edit_others`, `inventory_view_prices` and `tasks_reorder_family` none - only where the role profile is not already stricter. Existing accounts and a later change of the family role keep their rights.',
         admin: true,
         stateChanging: true,
         requestBody: jsonBody('#/components/schemas/UserCreateRequest'),

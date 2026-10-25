@@ -7,24 +7,29 @@ import { api } from '/api.js';
 import { openModal as openSharedModal, closeModal, confirmModal, confirmOverModal, reportFieldError, reportFieldErrors, constraintErrors, refocusAfterRender, whenModalClosed, captureModalContext, captureOpenContext, isModalContextCurrent, isOwnModalOpen } from '/components/modal.js';
 import { renderDocumentAttachField, bindDocumentAttachField, attachmentLinksNode } from '/components/document-attach.js';
 import { openDetailView } from '/components/detail-view.js';
-import { t, formatDate, getLocale, getNumberFormat, dateInputPlaceholder, parseDateInput, isDateInputValid } from '/i18n.js';
+import { t, getLocale, getNumberFormat, dateInputPlaceholder, parseDateInput, isDateInputValid } from '/i18n.js';
+import { dateText } from '/utils/date-format.js';
 import { esc, REQUIRED_MARK } from '/utils/html.js';
 import { rowActionHtml } from '/utils/row-action.js';
 import { installPopoverMenus, popoverMenuHtml } from '/utils/popover-menu.js';
 import { renderPageSearch, wirePageSearch } from '/utils/page-search.js';
-import { stagger } from '/utils/ux.js';
+import { stagger, scheduleUndoableDelete } from '/utils/ux.js';
+import { errorSentence } from '/utils/friendly-error.js';
 import { redrawList, collapseRow } from '/utils/list-motion.js';
 import { swapContent } from '/utils/content-swap.js';
 import { renderSkeletonList } from '/utils/skeleton.js';
-import { formatMoney, amountPlaceholder, toDecimalString, smallestUnitLabel, amountInputProblem, amountExample, amountToInput, toStoredNumber } from '/utils/money.js';
+import { formatMoney, amountPlaceholder, toDecimalString, amountInputProblem, amountToInput, toStoredNumber } from '/utils/money.js';
+// Der Satz zu einem Grund: derselbe Baustein wie in jedem Betragsfeld (D1).
+import { amountProblemText } from '/utils/amount-field.js';
 import { todayKey } from '/utils/date.js';
 import { zonedDateKey } from '/utils/timezone.js';
 import { wireTablist } from '/utils/tablist.js';
 import { attachSegmentIndicator } from '/utils/segment-indicator.js';
 import { findPageFab } from '/utils/fab.js';
-import { emptyStateHTML } from '/utils/empty-state.js';
-import { metricGlanceHtml, wireMetricGlance } from '/utils/metric-glance.js';
+import { emptyStateHTML, searchEmptyHTML } from '/utils/empty-state.js';
+import { metricGlanceHtml, wireMetricGlance, metricGlanceSkeletonHtml, metricCardsSkeletonHtml } from '/utils/metric-glance.js';
 import { isNavModuleReadOnly } from '/permissions.js';
+import { CATEGORY_SERIES_COLORS } from '/utils/budget-category-colors.js';
 
 let state = {
   meta: null,
@@ -96,6 +101,7 @@ let _onAddableChange = null;
 // Merker gilt nur fuer die schmale Bauart (split-expenses.css); breit steht
 // die Liste immer.
 let _groupPickerOpen = false;
+let _groupSearch = null;    // wirePageSearch-Handle der Gruppensuche (Zuruecksetzen aus dem Leerzustand)
 
 /**
  * Darf dieser Nutzer hier schreiben? (#467, #1265 P7)
@@ -129,6 +135,18 @@ function money(amount, currency) {
   const n = Number(amount || 0);
   if (!Number.isFinite(n)) return `${amount} ${currency}`;
   return formatMoney(n, currency);
+}
+
+/**
+ * DER TYP EINER GRUPPE, WENN ER ETWAS SAGT (R22, D9). Die Gruppe "Haushalt"
+ * vom Typ Haushalt stand als "Haushalt / Haushalt" im Kopf und als
+ * "Haushalt · Haushalt · 2 Mitglieder" in der Wahl. Gleicht der Typ dem
+ * Namen, faellt er weg; das Zeichen der Kachel sagt ihn weiter.
+ */
+function groupTypeLabel(group) {
+  const label = t(`splitExpenses.groupType.${group.type}`);
+  const same = String(group.name ?? '').trim().toLocaleLowerCase(getLocale()) === String(label).trim().toLocaleLowerCase(getLocale());
+  return same ? '' : label;
 }
 
 function groupIcon(type) {
@@ -247,8 +265,8 @@ export async function render(container, { user, embedded = false, onAddableChang
         <div class="split-main-column">
           <!-- Mobil EINE Zeile statt drei Karten (R14 P1): die Glance-Zeile
                klappt die Kennzahl-Zeile auf (metric-glance.js, budget.css). -->
-          <div id="split-glance"></div>
-          <section class="metric-grid budget-glance-details" id="split-summary"></section>
+          <div id="split-glance">${/* Der Kennzahl-Slot steht ab dem ersten Bild in seiner Form (R22, D4). */ ''}${metricGlanceSkeletonHtml()}</div>
+          <section class="metric-grid budget-glance-details" id="split-summary">${metricCardsSkeletonHtml(1, { note: false, tag: 'div' })}</section>
           <div class="split-main" id="split-main" aria-busy="true">${renderSkeletonList({ rows: 5, lines: 2 })}</div>
         </div>
       </div>${fab}
@@ -449,7 +467,7 @@ async function loadGroupData() {
   ]);
   // Ein spaeteres Laden hat inzwischen begonnen: dessen Stand gilt, nicht dieser.
   if (generation !== _activityGeneration) return;
-  state.expenses = expenses.items;
+  state.expenses = expenses.items.filter((entry) => !pendingExpenseDeletes.has(entry.id));
   state.expensesCursor = expenses.cursor;
   state.expensesKey = expensesKey;
   state.balances = balances.data || { balances: [], simplified_debts: [] };
@@ -459,6 +477,9 @@ async function loadGroupData() {
   state.groupMembers = groupMembers.data || [];
   state.recurring = recurring?.data || [];
 }
+
+/** Ausgaben in der Ruecknahmefrist: lokal weg, am Server noch da (R23, D6). */
+const pendingExpenseDeletes = new Set();
 
 /**
  * "Mehr laden" im Verlauf (#1309): die naechste Seite hinter dem Cursor,
@@ -547,7 +568,7 @@ function bindShell() {
   _container.querySelector('#split-add-expense')?.addEventListener('click', () => openExpenseModal());
   findPageFab('split-fab')?.addEventListener('click', () => openExpenseModal());
   // 250ms wie vorher: die Suche laedt die Gruppen vom Server neu.
-  wirePageSearch(_container, {
+  _groupSearch = wirePageSearch(_container, {
     id: 'split-group-search',
     delay: 250,
     onQuery: async (value) => {
@@ -646,6 +667,17 @@ function ownGroupBalance(balances = state.balances?.balances ?? [], userId = sta
   return { owed: part(1), owing: part(-1) };
 }
 
+/** Die eigene Summe ueber alle aktiven Gruppen (Dashboard des Servers), in der Form von ownGroupBalance(). */
+function allGroupsBalance() {
+  const rows = (list) => (list || []).map((row) => ({ amount: String(row.amount).replace(/^-/, ''), currency: row.currency }));
+  return { owed: rows(state.dashboard?.total_owed), owing: rows(state.dashboard?.total_owing) };
+}
+
+/** Eine Suche, die keine Gruppe trifft: ein Leerzustand an der Liste, nicht "Noch keine Gruppen". */
+function isGroupSearchMiss() {
+  return Boolean(state.query) && !state.groups.length;
+}
+
 /** "24,14 € · 12,00 $" aus Summenzeilen; ohne Zeile die Null in der Standardwaehrung. */
 function totalsText(rows) {
   return rows.length ? rows.map((r) => money(r.amount, r.currency)).join(' · ') : money(0, state.meta.default_currency);
@@ -662,9 +694,14 @@ function renderGroupsTotal() {
   const owed = state.dashboard?.total_owed || [];
   const owing = state.dashboard?.total_owing || [];
   el.hidden = isArchivedView() || !state.groups.length;
+  // Dieselbe Regel wie die Kennzahl (R22, D9): nur die Richtung, die nicht
+  // null ist - "Du bekommst 0,00 €" war eine Aussage ohne Inhalt.
+  const parts = [
+    owed.length ? `<span class="split-groups-total__part">${t('splitExpenses.youAreOwed')} <strong>${totalsText(owed)}</strong></span>` : '',
+    owing.length ? `<span class="split-groups-total__part">${t('splitExpenses.youOwe')} <strong>${totalsText(owing)}</strong></span>` : '',
+  ].filter(Boolean);
   setHtml(el, `<span class="split-groups-total__label">${t('splitExpenses.allGroups')}</span>
-    <span class="split-groups-total__part">${t('splitExpenses.youAreOwed')} <strong>${totalsText(owed)}</strong></span>
-    <span class="split-groups-total__part">${t('splitExpenses.youOwe')} <strong>${totalsText(owing)}</strong></span>`);
+    ${parts.length ? parts.join('\n    ') : `<span class="split-groups-total__part">${t('splitExpenses.balanced')}</span>`}`);
 }
 
 function renderSummary() {
@@ -674,7 +711,10 @@ function renderSummary() {
   // ueber dem Saldo der Gruppe "Linda schuldet Alex 24,14 €": zwei Zahlen fuer
   // scheinbar dieselbe Frage. Die Summe aller Gruppen steht jetzt in der
   // Gruppenwahl (renderGroupsTotal()).
-  const { owed, owing } = ownGroupBalance();
+  // OHNE GEWAEHLTE GRUPPE (Suche ohne Treffer, Critique R23 P1) gilt die Summe
+  // ueber ALLE aktiven Gruppen - sonst stand hier "Ausgeglichen 0,00 €", eine
+  // Aussage ueber eine Gruppe, die es in diesem Bild nicht gibt.
+  const { owed, owing } = isGroupSearchMiss() && !isArchivedView() ? allGroupsBalance() : ownGroupBalance();
   renderGroupsTotal();
   // Geteilte Kennzahlkarte des Budget-Moduls (budget.css). Die frühere eigene
   // .split-summary-card war die dritte von fünf Bauarten im selben Modul
@@ -687,50 +727,51 @@ function renderSummary() {
   if (count) count.textContent = String(state.groups.length);
   const owedText = totalsText(owed);
   const owingText = totalsText(owing);
-  // DER BEREICH STEHT IM LABEL (Critique R19, P1 Desktop-Komposition). Die
-  // Kacheln gehoeren der gewaehlten Gruppe, die dritte Kachel „Aktive Gruppen"
-  // aber allen - nebeneinander lasen sich „Du schuldest 24,14 €" und „2" als
-  // EINE Aussage, und mobil steht die Gruppenwahl erst unter den Zahlen. Jetzt
-  // nennen beide Betraege ihre Gruppe, und die Gruppenzahl steht nur noch am
-  // Kopf der Liste, die sie zaehlt (`#split-group-count`).
+  // DER BEREICH STEHT IM LABEL (Critique R19, P1 Desktop-Komposition): die
+  // Karten nennen ihre Gruppe, die Gruppenzahl steht am Kopf der Liste, die sie
+  // zaehlt (`#split-group-count`). Die Kurzzeile (nur schmal, direkt ueber der
+  // Gruppenwahl, die den Namen traegt) nennt sie nicht (R19).
   const group = state.groups.find((g) => g.id === state.activeGroupId)?.name;
-  const owedLabel = group ? t('splitExpenses.youAreOwedInGroup', { group }) : t('splitExpenses.youAreOwed');
-  const owingLabel = group ? t('splitExpenses.youOweInGroup', { group }) : t('splitExpenses.youOwe');
+  const inGroup = (plain, scoped) => (group ? t(scoped, { group }) : t(plain));
+  /* EINE SALDO-AUSSAGE (R22, D9). Bis dahin standen beide Richtungen da, und
+   * gross die erste: mobil "Du bekommst 0,00 €" in Display-Groesse, klein
+   * daneben "Du schuldest 24,14 €", am Desktop zwei 210px-Karten, eine davon
+   * eine Null - drei Saetze fuer eine Antwort. Die Kennzahl ist jetzt die
+   * Richtung, die nicht null ist; ohne Saldo "Ausgeglichen". Nur wer in einer
+   * Gruppe in zwei Waehrungen in beide Richtungen steht, sieht beide. */
+  const both = owed.length > 0 && owing.length > 0;
+  const lead = owing.length && !owed.length
+    ? { label: 'splitExpenses.youOwe', scoped: 'splitExpenses.youOweInGroup', value: owingText, tone: 'neutral' }
+    : owed.length
+      ? { label: 'splitExpenses.youAreOwed', scoped: 'splitExpenses.youAreOwedInGroup', value: owedText, tone: 'positive' }
+      : { label: 'splitExpenses.balanced', scoped: 'splitExpenses.balancedInGroup', value: owedText, tone: 'neutral' };
   const glance = _container.querySelector('#split-glance');
   if (glance) {
     const expanded = summary?.classList?.contains('is-expanded') ?? false;
-    // DIE KURZZEILE NENNT DIE GRUPPE NICHT (R19, Critique 2026-10-16). Sie steht
-    // nur schmal, und dort direkt ueber der Gruppenwahl, die den Namen schon
-    // traegt; mit ihm brach "Du bekommst in Haushalt" bei 390px in zwei Zeilen
-    // und "Du schuldest in Haushalt 24,14 €" stand daneben gedraengt. Die
-    // Karten (breit, und aufgeklappt) behalten das Label mit Gruppe.
+    // Eine Zahl: die Kurzzeile ohne Aufklapper (metric-glance.js) - die Karte
+    // darunter wiederholte nur dieselbe Zahl mit dem Gruppennamen.
     setHtml(glance, metricGlanceHtml({
-      id: 'split-glance-more',
-      controls: 'split-summary',
-      expanded,
-      label: t('splitExpenses.youAreOwed'),
-      value: owedText,
-      tone: owed.length ? 'positive' : 'neutral',
+      ...(both ? { id: 'split-glance-more', controls: 'split-summary', expanded } : {}),
+      label: t(lead.label),
+      value: lead.value,
+      tone: lead.tone,
       // Eine offene Schuld in der Gruppe ist Alltag, kein Alarm (Critique R21,
       // D8): Textfarbe. „Du bekommst" darf gruen bleiben wie eine Einnahme.
-      flows: [{ label: t('splitExpenses.youOwe'), amount: owingText, tone: '' }],
+      flows: both ? [{ label: t('splitExpenses.youOwe'), amount: owingText, tone: '' }] : [],
     }));
-    wireMetricGlance(glance, 'split-glance-more');
+    if (both) wireMetricGlance(glance, 'split-glance-more');
   }
-  // DER TON GILT DEM BETRAG, NICHT DER KARTE (Critique 2026-10-05, R16): „Du
-  // bekommst 0,00 €" stand in Erfolgsgruen, „Du schuldest 0,00 €" in Rot. Null
-  // ist weder Gewinn noch Schuld - die Kurzzeile darueber hielt das schon so
-  // (`tone` nur mit Betrag), die Karten jetzt auch.
-  setHtml(summary, `
-    <div class="metric-card${owed.length ? ' metric-card--positive' : ''}">
-      <div class="metric-card__label">${esc(owedLabel)}</div>
-      <div class="metric-card__value">${owedText}</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-card__label">${esc(owingLabel)}</div>
-      <div class="metric-card__value">${owingText}</div>
-    </div>
-  `);
+  // DER TON GILT DEM BETRAG, NICHT DER KARTE (Critique 2026-10-05, R16): Null
+  // ist weder Gewinn noch Schuld.
+  const card = (label, value, tone) => `
+    <div class="metric-card${tone === 'positive' ? ' metric-card--positive' : ''}">
+      <div class="metric-card__label">${esc(label)}</div>
+      <div class="metric-card__value">${value}</div>
+    </div>`;
+  setHtml(summary, both
+    ? card(inGroup('splitExpenses.youAreOwed', 'splitExpenses.youAreOwedInGroup'), owedText, 'positive')
+      + card(inGroup('splitExpenses.youOwe', 'splitExpenses.youOweInGroup'), owingText, 'neutral')
+    : card(inGroup(lead.label, lead.scoped), lead.value, lead.tone));
 }
 
 /**
@@ -750,11 +791,11 @@ function syncGroupSwitch() {
   panel.classList.toggle('split-groups-panel--open', open);
   btn.setAttribute('aria-expanded', String(open));
   setHtml(btn, `
-    <span class="split-group__avatar"><i data-lucide="${group ? groupIcon(group.type) : 'users-round'}" aria-hidden="true"></i></span>
+    <span class="split-group__avatar budget-tile"><i data-lucide="${group ? groupIcon(group.type) : 'users-round'}" aria-hidden="true"></i></span>
     <span class="split-group__body">
       <span class="sr-only">${t('splitExpenses.groups')}: </span>
       <span class="split-group__name">${group ? esc(group.name) : t('splitExpenses.groups')}</span>
-      ${group ? `<span class="split-group__meta">${t(`splitExpenses.groupType.${group.type}`)} · ${group.member_count} ${t('splitExpenses.members')}${isArchivedView() ? ` · ${t('splitExpenses.statusArchived')}` : ''}</span>` : ''}
+      ${group ? `<span class="split-group__meta">${groupTypeLabel(group) ? `${esc(groupTypeLabel(group))} · ` : ''}${group.member_count} ${t('splitExpenses.members')}${isArchivedView() ? ` · ${t('splitExpenses.statusArchived')}` : ''}</span>` : ''}
     </span>
     <i data-lucide="chevron-down" class="icon-md split-group-switch__chevron" aria-hidden="true"></i>`);
   if (window.lucide) lucide.createIcons({ el: btn });
@@ -763,6 +804,18 @@ function syncGroupSwitch() {
 function renderGroups() {
   syncGroupSwitch();
   const el = _container.querySelector('#split-groups');
+  if (isGroupSearchMiss()) {
+    setHtml(el, searchEmptyHTML({ query: state.query, className: 'split-empty-inline', resetAttrs: { 'data-split-reset-search': '' } }));
+    el.querySelector('[data-split-reset-search]')?.addEventListener('click', async () => {
+      _groupSearch?.clear();
+      state.query = '';
+      await loadGroups();
+      await loadGroupData();
+      renderAll();
+      _groupSearch?.input?.focus();
+    });
+    return;
+  }
   if (!state.groups.length) {
     setHtml(el, isArchivedView()
       ? emptyStateHTML({
@@ -782,10 +835,10 @@ function renderGroups() {
   }
   setHtml(el, state.groups.map((group) => `
     <button class="split-group ${group.id === state.activeGroupId ? 'split-group--active' : ''}" type="button" data-group-id="${group.id}">
-      <span class="split-group__avatar"><i data-lucide="${groupIcon(group.type)}" aria-hidden="true"></i></span>
+      <span class="split-group__avatar budget-tile"><i data-lucide="${groupIcon(group.type)}" aria-hidden="true"></i></span>
       <span class="split-group__body">
         <span class="split-group__name">${esc(group.name)}</span>
-        <span class="split-group__meta">${t(`splitExpenses.groupType.${group.type}`)} · ${group.member_count} ${t('splitExpenses.members')}</span>
+        <span class="split-group__meta">${groupTypeLabel(group) ? `${esc(groupTypeLabel(group))} · ` : ''}${group.member_count} ${t('splitExpenses.members')}</span>
       </span>
     </button>
   `).join(''));
@@ -859,6 +912,13 @@ function collapseSplitRow(key) {
 function drawMain(main) {
   main.removeAttribute('aria-busy');
   const group = state.groups.find((g) => g.id === state.activeGroupId);
+  // Die Suche ohne Treffer steht EINMAL, an der Liste, die gesucht wurde
+  // (renderGroups) - hier stand derselbe Satz "Noch keine Ausgabengruppen"
+  // ein zweites Mal, und er war falsch: es gibt Gruppen, nur keine Treffer.
+  if (!group && isGroupSearchMiss()) {
+    setHtml(main, '');
+    return;
+  }
   if (!group) {
     setHtml(main, isArchivedView()
       ? emptyStateHTML({
@@ -902,7 +962,7 @@ function drawMain(main) {
     <section class="split-group-header${toolsOnly ? ' split-group-header--tools-only' : ''}">
       <div class="split-group-header__text">
         <${GroupTag} class="split-group-name">${esc(group.name)}</${GroupTag}>
-        <p class="split-group-type">${t(`splitExpenses.groupType.${group.type}`)}</p>
+        ${groupTypeLabel(group) ? `<p class="split-group-type">${esc(groupTypeLabel(group))}</p>` : ''}
         ${archived ? `<p class="split-archived-badge"><i data-lucide="archive" class="icon-md" aria-hidden="true"></i>${t('splitExpenses.statusArchived')}</p>` : ''}
         <p class="split-group-desc">${esc(group.description || t('splitExpenses.groupDefaultDescription'))}</p>
         ${ro ? groupMetaHtml(group) : ''}
@@ -1086,10 +1146,10 @@ function renderExpenses(asList = false) {
       ? ` <span class="split-expense__receipt" role="img" aria-label="${esc(t('splitExpenses.receiptsAttachedLabel', { count: receiptCount }))}"><i data-lucide="paperclip" aria-hidden="true"></i></span>`
       : '';
     const body = `
-      <div class="split-expense__icon"><i data-lucide="${categoryIcon(expense.category)}" aria-hidden="true"></i></div>
+      <div class="split-expense__icon budget-tile"${categoryTone(expense.category)}><i data-lucide="${categoryIcon(expense.category)}" aria-hidden="true"></i></div>
       <div class="split-expense__body">
         <strong>${esc(expense.title)}</strong>
-        <span>${t('splitExpenses.paidBy')}: ${esc(expense.payer_name || '')} · ${formatDate(expense.expense_date)}${receiptMark}</span>
+        <span>${t('splitExpenses.paidBy')}: ${esc(expense.payer_name || '')} · ${dateText(expense.expense_date)}${receiptMark}</span>
       </div>
       <div class="split-expense__amount">${money(expense.amount, expense.currency)}</div>
     `;
@@ -1172,12 +1232,12 @@ function renderRecurring(asList = false) {
     const paused = Boolean(recurring.paused_at);
     const when = paused
       ? `<span class="split-recurring__state">${esc(t('splitExpenses.recurring.paused'))}</span>`
-      : `<span>${esc(`${t('splitExpenses.recurring.nextDate')}: ${formatDate(recurring.next_run_date)}`)}</span>`;
+      : `<span>${esc(`${t('splitExpenses.recurring.nextDate')}: ${dateText(recurring.next_run_date)}`)}</span>`;
     const reason = recurring.blocked_reason
       ? `<span class="split-recurring__reason">${esc(t(`splitExpenses.recurring.reason.${recurring.blocked_reason}`))}</span>`
       : '';
     const body = `
-      <div class="split-expense__icon"><i data-lucide="${categoryIcon(recurring.category)}" aria-hidden="true"></i></div>
+      <div class="split-expense__icon budget-tile"${categoryTone(recurring.category)}><i data-lucide="${categoryIcon(recurring.category)}" aria-hidden="true"></i></div>
       <div class="split-expense__body">
         <strong>${esc(recurring.title)}</strong>
         <span>${esc(frequencyLabel(recurring.frequency))}</span>
@@ -1256,7 +1316,7 @@ function recurringResumeChoice(recurring) {
       closeModal({ force: true });
       resolve(value);
     };
-    const detail = t('splitExpenses.recurring.missedDetail', { count: recurring.missed_count, date: formatDate(recurring.next_run_date) });
+    const detail = t('splitExpenses.recurring.missedDetail', { count: recurring.missed_count, date: dateText(recurring.next_run_date) });
     openSharedModal({
       pointerDeadTime: true,
       title: t('splitExpenses.recurring.missedQuestion'),
@@ -1265,8 +1325,8 @@ function recurringResumeChoice(recurring) {
         <p class="modal-confirm__detail" id="split-resume-detail">${esc(detail)}</p>
         <div class="modal-actions modal-actions--stack">
           <div class="modal-actions modal-actions--stack split-resume-choices" role="group" aria-labelledby="split-resume-detail">
-            <button type="button" class="btn btn--primary" data-resume="skip">${esc(t('splitExpenses.recurring.missedSkip', { date: formatDate(recurring.resume_date) }))}</button>
-            <button type="button" class="btn btn--secondary" data-resume="book">${esc(t('splitExpenses.recurring.missedBook', { date: formatDate(recurring.next_run_date) }))}</button>
+            <button type="button" class="btn btn--primary" data-resume="skip">${esc(t('splitExpenses.recurring.missedSkip', { date: dateText(recurring.resume_date) }))}</button>
+            <button type="button" class="btn btn--secondary" data-resume="book">${esc(t('splitExpenses.recurring.missedBook', { date: dateText(recurring.next_run_date) }))}</button>
           </div>
           <button type="button" class="btn btn--secondary" id="split-resume-cancel">${esc(t('common.cancel'))}</button>
         </div>`,
@@ -1449,7 +1509,7 @@ function activityItemHtml(item, actionable) {
       <div>
         <strong>${esc(t(`splitExpenses.activityType.${item.type}`))}</strong>
         ${detail}
-        <span>${esc(item.actor_name || t('splitExpenses.system'))} · ${esc(formatDate(zonedDateKey(item.created_at)))}</span>
+        <span>${esc(item.actor_name || t('splitExpenses.system'))} · ${esc(dateText(zonedDateKey(item.created_at)))}</span>
         ${reversed}
       </div>
       ${action}
@@ -1509,6 +1569,20 @@ async function reverseSettlement(settlementId) {
     renderAll();
     refocusAfterRender();
   }
+}
+
+/**
+ * DIE KATEGORIE EINER AUSGABE HAT EINE FARBE (R22, D9). Die Lead-Kachel der
+ * Zeile ist getoent wie die eines Kontos oder Abos; die Farbe kommt aus der
+ * Datenreihen-Palette (tokens.css, dieselbe wie die Budget-Kategorien), fest
+ * je Kategorie in der Reihenfolge der Auswahl, damit sie sich nie verschiebt.
+ * "Allgemein" (und was unbekannt ist) bleibt neutral - der Rest der Liste
+ * sagt es ueber das Zeichen.
+ */
+const CATEGORY_TONE_ORDER = ['groceries', 'rent', 'utilities', 'baby', 'pets', 'school', 'travel', 'shopping', 'subscriptions', 'health', 'home'];
+function categoryTone(category) {
+  const i = CATEGORY_TONE_ORDER.indexOf(category);
+  return i < 0 ? '' : ` style="--tile-color:${CATEGORY_SERIES_COLORS[i % CATEGORY_SERIES_COLORS.length]}"`;
 }
 
 function categoryIcon(category) {
@@ -1723,15 +1797,6 @@ function updateSplitInputs(panel) {
  */
 const decimalString = toDecimalString;
 
-/**
- * Der Text zu einem Grund aus amountInputProblem() (utils/money.js).
- */
-function amountProblemText(problem, currency) {
-  if (problem === 'grouped') return t('common.amountGrouped', { example: amountExample(currency) });
-  if (problem === 'invalid') return t('common.amountInvalid', { example: amountExample(currency) });
-  if (problem === 'notPositive') return t('common.amountNotPositive');
-  return t('common.amountPrecisionRequired', { currency, step: smallestUnitLabel(currency) });
-}
 
 /**
  * Weist einen Betrag zurück, den der Server nicht annähme, und nennt den Grund
@@ -2069,7 +2134,7 @@ function expenseReadSections(expense) {
   return [
     { icon: 'banknote', label: t('splitExpenses.amount'), value: money(expense.amount, expense.currency) },
     { icon: 'user', label: t('splitExpenses.paidBy'), value: expense.payer_name || '' },
-    { icon: 'calendar', label: t('splitExpenses.date'), value: expense.expense_date ? formatDate(expense.expense_date) : '' },
+    { icon: 'calendar', label: t('splitExpenses.date'), value: expense.expense_date ? dateText(expense.expense_date) : '' },
     { icon: 'split', label: t('splitExpenses.splitMethod'),
       value: t(`splitExpenses.split${method.charAt(0).toUpperCase()}${method.slice(1)}`) },
     { icon: 'users', label: t('splitExpenses.participants'), value: shares, multiline: true },
@@ -2163,7 +2228,7 @@ function openExpenseModal(expense = null, prefill = null) {
           icon: 'receipt',
         })}
         <div class="modal-panel__footer modal-panel__footer--plain">
-          ${isEdit ? `<button class="btn btn--danger-outline" type="button" id="split-delete-expense" style="margin-inline-end:auto">
+          ${isEdit ? `<button class="btn btn--danger-outline" type="button" id="split-delete-expense">
             <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
           </button>` : ''}
           <div class="split-form__footer-actions">
@@ -2189,21 +2254,34 @@ function openExpenseModal(expense = null, prefill = null) {
       wireSplitFields(panel, '#split-expense-form');
       panel.querySelector('#split-delete-expense')?.addEventListener('click', async () => {
         if (readOnly()) return;
-        // confirmOverModal statt confirmModal: das Ausgaben-Formular trägt
-        // Betrag, Teilnehmer, Aufteilung und wartende Belege - „Abbrechen" gibt
-        // es unverändert zurück, statt alles davon zu verdrängen.
-        const confirmed = await confirmOverModal(t('splitExpenses.deleteExpenseConfirm'), {
-          danger: true,
-          confirmLabel: t('common.delete'),
-          detail: t('splitExpenses.deleteExpenseConfirmDetail'),
-        });
-        if (!confirmed) return;
-        await api.delete(`/split-expenses/expenses/${expense.id}`);
-        await refreshDashboard();
-        await loadGroupData();
-        await collapseSplitRow(`expense-${expense.id}`);
+        // RUECKGAENGIG STATT RUECKFRAGE (Critique R23, D6): eine Ausgabe ist
+        // kein Behaelter. Sie geht sofort aus der Liste, geloescht wird erst mit
+        // dem Ende der Toast-Frist - bis dahin rechnen die Salden mit ihr.
+        closeModal({ force: true, context: captureModalContext() });
+        const id = expense.id;
+        pendingExpenseDeletes.add(id);
+        state.expenses = state.expenses.filter((entry) => entry.id !== id);
+        await collapseSplitRow(`expense-${id}`);
         renderAll({ motion: true });
         refocusAfterRender();
+        scheduleUndoableDelete({
+          commit: async ({ keepalive } = {}) => {
+            await api.delete(`/split-expenses/expenses/${id}`, { keepalive });
+            pendingExpenseDeletes.delete(id);
+            await refreshDashboard();
+            await loadGroupData();
+            renderAll({ motion: true });
+            refocusAfterRender();
+          },
+          restore: async (err) => {
+            pendingExpenseDeletes.delete(id);
+            if (err) window.yuvomi?.showToast(errorSentence(err), 'danger');
+            await loadGroupData();
+            renderAll({ motion: true });
+            refocusAfterRender();
+          },
+          message: expense.title ? t('common.deletedNamed', { name: expense.title }) : t('splitExpenses.expenseDeleted'),
+        });
       });
       panel.querySelector('#split-expense-form')?.addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -2329,7 +2407,7 @@ function recurringReadSections(recurring) {
     { icon: 'banknote', label: t('splitExpenses.amount'), value: money(recurring.amount, recurring.currency) },
     { icon: 'user', label: t('splitExpenses.paidBy'), value: recurring.payer_name || '' },
     { icon: 'repeat', label: t('budget.recurringIntervalLabel'), value: frequencyLabel(recurring.frequency) },
-    { icon: 'calendar', label: t('splitExpenses.recurring.nextDate'), value: recurring.paused_at ? '' : formatDate(recurring.next_run_date) },
+    { icon: 'calendar', label: t('splitExpenses.recurring.nextDate'), value: recurring.paused_at ? '' : dateText(recurring.next_run_date) },
     { icon: 'circle-pause', label: t('splitExpenses.statusLabel'), value: recurringStateText(recurring) },
     { icon: 'split', label: t('splitExpenses.splitMethod'),
       value: t(`splitExpenses.split${method.charAt(0).toUpperCase()}${method.slice(1)}`) },
@@ -2413,7 +2491,7 @@ function openRecurringModal(recurring = null) {
         <label class="form-field"><span class="form-label">${t('splitExpenses.notes')}</span><textarea class="form-input" name="description" rows="3" maxlength="5000">${esc(recurring?.description || '')}</textarea></label>
         ${isEdit ? `<p class="form-hint">${t('splitExpenses.recurring.editHint')}</p>` : ''}
         <div class="modal-panel__footer modal-panel__footer--plain">
-          ${isEdit ? `<button class="btn btn--danger-outline" type="button" id="split-delete-recurring" style="margin-inline-end:auto">
+          ${isEdit ? `<button class="btn btn--danger-outline" type="button" id="split-delete-recurring">
             <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
           </button>` : ''}
           <div class="split-form__footer-actions">
@@ -2492,7 +2570,7 @@ function openRecurringModal(recurring = null) {
           // Dialog bleibt offen.
           if (err?.data?.reason === 'next_run_not_after_last_booking') {
             reportFieldError(form.querySelector('[name="next_run_date"]'),
-              t('splitExpenses.recurring.dateBooked', { date: formatDate(err.data.last_booked) }));
+              t('splitExpenses.recurring.dateBooked', { date: dateText(err.data.last_booked) }));
             return;
           }
           throw err;
@@ -2685,7 +2763,7 @@ async function openMemberModal() {
         <label class="form-field"><span class="form-label">${t('splitExpenses.member')}</span><select class="form-input" name="member_ref">${memberCandidateOptions(candidates)}</select></label>
         <label class="form-field"><span class="form-label">${t('splitExpenses.role')}</span><select class="form-input" name="role"><option value="guest">${t('splitExpenses.roleGuest')}</option><option value="admin">${t('splitExpenses.roleAdmin')}</option></select></label>
         <div class="modal-panel__footer modal-panel__footer--plain">
-          <button class="btn btn--secondary" type="button" id="split-new-guest" style="margin-inline-end:auto">${t('splitExpenses.createGuest')}</button>
+          <button class="btn btn--secondary modal-panel__footer-start" type="button" id="split-new-guest">${t('splitExpenses.createGuest')}</button>
           <div class="split-form__footer-actions">
             <button class="btn btn--secondary" type="button" id="split-cancel-member">${t('common.cancel')}</button>
             <button class="btn btn--primary" type="submit" id="split-save-member">${t('common.add')}</button>
@@ -2802,6 +2880,8 @@ export const __test = {
   renderSummaryForTest(container) { _container = container; renderSummary(); },
   // R17/E5: der eigene Saldo der gewaehlten Gruppe und die Summe aller Gruppen.
   ownGroupBalance, groupToolsTriggerHtml,
+  // R22 D9: der Typ einer Gruppe faellt weg, wo er ihren Namen wiederholt.
+  groupTypeLabel,
   // #1997: Mitglied und Gast speichern schliessen nur ihren eigenen Dialog
   // (test-split-amount-input.js).
   openMemberModal, openGuestModal,

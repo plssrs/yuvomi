@@ -5,7 +5,7 @@
  */
 
 import { api } from '/api.js';
-import { openModal as openSharedModal, closeModal, advancedSection, refocusAfterRender, captureModalContext, captureOpenContext, isModalContextCurrent } from '/components/modal.js';
+import { openModal as openSharedModal, closeModal, advancedSection, refocusAfterRender, captureModalContext, captureOpenContext, isModalContextCurrent, reportFieldErrors } from '/components/modal.js';
 import { errorSentence, isAlreadyDeleted, loadErrorSentence } from '/utils/friendly-error.js';
 import { openDetailView, leaveDetailTo } from '/components/detail-view.js';
 import { stagger, vibrate, wireScrollFade, scheduleUndoableDelete } from '/utils/ux.js';
@@ -268,8 +268,8 @@ export async function render(container, { user, signal } = {}) {
       </div>
       <div id="contacts-status" class="sr-only" role="status" aria-live="polite"></div>
       <div class="split-view contacts-split">
-        <div id="contacts-list" class="contacts-list page-scrollport split-view__list" aria-busy="true">
-          <div class="contacts-filters page-chip-row" id="contacts-filters" role="group" aria-label="${t('contacts.categoryLabel')}"></div>
+        <div id="contacts-list" class="contacts-list page-scrollport split-view__list" data-scroll-port="contacts" aria-busy="true">
+          <div class="contacts-filters page-chip-row" id="contacts-filters" role="group" aria-label="${t('contacts.categoryLabel')}" data-pending></div>
           <div id="contacts-rows" class="contacts-rows">${renderSkeletonList({ rows: 6, lines: 2 })}</div>
         </div>
         ${splitViewDetailHtml({
@@ -416,6 +416,7 @@ export async function render(container, { user, signal } = {}) {
   // Kategorie-Filter: Rand-Fade-Affordanz für die scrollende Chipzeile
   // (geteilte has-fade-*-Konvention, Audit F-06 — Scrollbalken ist versteckt).
   wireScrollFade(_container.querySelector('#contacts-filters'));
+  wireWheelToRow(_container.querySelector('#contacts-filters'));
   _container.querySelector('#contacts-filters').addEventListener('click', (e) => {
     const chip = e.target.closest('[data-cat]');
     if (!chip) return;
@@ -512,6 +513,9 @@ function filterCategoryKeys() {
 function renderCategoryFilters() {
   const bar = _container?.querySelector('#contacts-filters');
   if (!bar) return;
+  // Die Reihe haelt ihren Platz, bis die Daten da sind (contacts.css, R23):
+  // gerufen wird hier erst mit ihnen.
+  bar.removeAttribute('data-pending');
   const active = state.activeCategory;
   const keys = filterCategoryKeys();
   // Nur neu bauen, wenn sich die Menge der Chips geaendert hat: renderList()
@@ -663,6 +667,7 @@ function contactsEmptyStateHtml(filtered) {
     description: ro ? '' : t('contacts.emptyDescription'),
     hint: ro ? '' : t('emptyHint.contacts'),
     action: ro ? null : {
+      tone: 'secondary',
       label: t('contacts.emptyAction'),
       icon: 'plus',
       attrs: { 'data-action': 'empty-cta' },
@@ -891,10 +896,12 @@ function renderContactItem(c) {
   }
 
   // Primäre, stets sichtbare Zeilenaktion: Anrufen (falls Telefon vorhanden).
+  // Neutral wie jede Zeilenaktion (R23, Ulas 25.10.; bis dahin gruen nach
+  // Audit F1) - die Modulfarbe traegt "Anrufen" in der Leseansicht.
   // Der Name nennt die Person: zwoelf Zeilen, die alle "Anrufen" heissen, sind
   // fuer einen Screenreader eine Zeile.
   const callBtn = c.phone
-    ? `<a href="tel:${esc(c.phone)}" data-phone-raw="${esc(c.phone)}" class="row-action row-action--success" aria-label="${esc(t('contacts.callNamed', { name: c.name }))}">
+    ? `<a href="tel:${esc(c.phone)}" data-phone-raw="${esc(c.phone)}" class="row-action" aria-label="${esc(t('contacts.callNamed', { name: c.name }))}">
          <i data-lucide="phone" aria-hidden="true"></i>
        </a>`
     : '';
@@ -1103,12 +1110,18 @@ function renderContactDetail(contact, { onBirthdayLinked = null } = {}) {
     {
       icon: 'cake',
       label: t('contacts.birthdayLabel'),
-      value: birthDateText(contact.birthday, contact.birthday_year_unknown),
+      // Ohne eigenes Datum zeigt die Zeile das des verknuepften Geburtstags
+      // (R22, D7: der Geburtstag-Dialog verknuepft auch Kontakte ohne Datum) -
+      // sonst fiele die Zeile weg und mit ihr der Weg dorthin.
+      value: contact.birthday
+        ? birthDateText(contact.birthday, contact.birthday_year_unknown)
+        : birthDateText(contact.birthday_link_date, contact.birthday_link_year_unknown),
       // DER WEG ZUM GEBURTSTAG (Critique R21, D7; #2149): verknuepft fuehrt
       // die Zeile dorthin, unverknuepft legt sie den Eintrag an - in derselben
       // Folgeaktion, siehe birthdayRowAction().
       action: birthdayRowAction(contact, onBirthdayLinked),
     },
+    birthdaySuggestionRow(contact, onBirthdayLinked),
     {
       icon: 'globe',
       label: t('contacts.websiteLabel'),
@@ -1546,11 +1559,11 @@ function buildContactForm({ mode, contact = null }) {
     ${advancedSection(advancedFieldsHtml, { open: advancedOpen })}
 
     <div class="modal-panel__footer contact-modal__footer">
-      ${isEdit && !contact.family_user_id ? `<button type="button" class="btn btn--danger-outline" id="cm-delete" style="margin-inline-end:auto">
+      ${isEdit && !contact.family_user_id ? `<button type="button" class="btn btn--danger-outline" id="cm-delete">
         <i data-lucide="trash-2" class="icon-md" aria-hidden="true"></i>${t('common.delete')}
       </button>` : '<div></div>'}
       <div class="contact-modal__footer-actions">
-        <button class="btn btn--secondary" id="cm-cancel">${t('common.cancel')}</button>
+        <button type="button" class="btn btn--secondary" id="cm-cancel" data-action="close-modal">${t('common.cancel')}</button>
         <button class="btn btn--primary" id="cm-save">${isEdit ? t('common.save') : t('common.add')}</button>
       </div>
     </div>`;
@@ -1559,6 +1572,12 @@ function buildContactForm({ mode, contact = null }) {
     title: isEdit ? t('contacts.editContact') : t('contacts.newContact'),
     content,
     wire(panel) {
+      // EIN RUECKWEG IM BEARBEITEN (R23 S11b, Critique G5 P3; Kanon R19 in
+      // detail-view.js): mit `data-action="close-modal"` erkennt die
+      // Detailansicht das Abbrechen als den Weg zurueck in die Leseansicht und
+      // nimmt ihr Kopf-"Zurueck" weg. Vorher standen mobil drei Ausgaenge da
+      // (Zurueck, x, Abbrechen), und Abbrechen schloss das ganze Blatt. Der
+      // eigene Listener bleibt fuer den Anlege-Dialog ohne Leseansicht.
       panel.querySelector('#cm-cancel').addEventListener('click', closeModal);
 
       // Mehrwert-Gruppen: Zeile ergänzen/entfernen (Telefon + E-Mail).
@@ -1668,11 +1687,10 @@ function buildContactForm({ mode, contact = null }) {
           return;
         }
 
-        if (!name) {
-          window.yuvomi?.showToast(t('contacts.nameRequiredHint'), 'danger');
-          panel.querySelector('#cm-first-name').focus();
-          return;
-        }
+        // DER FEHLER STEHT AM FELD (R23, Critique G5 P3; D8 wie Geburtstage):
+        // vorher ein Toast, der das Feld nicht nannte - jetzt die Meldung am
+        // Vornamen (aria-invalid, aria-describedby), der Fokus darin.
+        if (!name && reportFieldErrors([[panel.querySelector('#cm-first-name'), t('contacts.nameRequiredHint')]])) return;
 
         saveBtn.disabled    = true;
         saveBtn.textContent = '…';
@@ -1784,8 +1802,10 @@ function exitSelectMode() {
   // Menue-Knopf, ueber den man hineingekommen ist - sonst faellt er auf <body>.
   const refocus = _container.querySelector('#contacts-select-cancel')?.contains(document.activeElement);
   syncSelectChrome();
-  if (refocus) _container.querySelector('.contacts-toolbar .page-tools-btn')?.focus();
+  // ERST die Klasse, DANN der Fokus: im Auswahlmodus ist das Menue
+  // ausgeblendet (contacts.css, R23) und nimmt keinen Fokus an.
   _container.querySelector('.contacts-page')?.classList.remove('is-selecting');
+  if (refocus) _container.querySelector('.contacts-toolbar .page-tools-btn')?.focus();
   setSelectionBulk(md, null);
   renderList();
 }
@@ -2053,6 +2073,26 @@ function openImportSelectionModal(named, skipped) {
   });
 }
 
+/**
+ * DIE CHIPREIHE BLEIBT EINE REIHE, AUCH AM DESKTOP (Critique R22, D20). Bis
+ * dahin brach sie am Zeigergeraet in zwei Reihen um (R10 L8: "eine Maus hat
+ * keine waagerechte Geste") und kostete 1280/1440 rund 48px Hoehe ueber der
+ * Liste. Jetzt scrollt sie wie mobil mit Fade an der Kante (`wireScrollFade`),
+ * und das Mausrad, das nur senkrecht dreht, bewegt sie waagerecht - solange
+ * es in seiner Richtung noch etwas zu zeigen gibt. Am Ende der Reihe (und
+ * mit Strg zum Zoomen, oder einer echten Waagerecht-Geste vom Trackpad) geht
+ * das Rad an die Seite weiter; die Seite scrollt also nie fest.
+ * @param {HTMLElement|null} row
+ */
+function wireWheelToRow(row) {
+  row?.addEventListener('wheel', (e) => {
+    if (e.ctrlKey || e.deltaX !== 0 || e.deltaY === 0 || row.scrollWidth <= row.clientWidth) return;
+    const before = row.scrollLeft;
+    row.scrollLeft = before + e.deltaY;
+    if (row.scrollLeft !== before) e.preventDefault();
+  }, { passive: false });
+}
+
 /** Die Adresse eines Geburtstags: dieselbe wie aus der Suche (`?open=`). */
 function birthdayHref(id) {
   return `/birthdays?open=${encodeURIComponent(String(id))}`;
@@ -2084,13 +2124,78 @@ function birthdayRowAction(contact, onLinked = null) {
       onClick: () => leaveDetailTo(birthdayHref(contact.birthday_id)),
     } : null;
   }
-  if (!contact.birthday || !mayOpenBirthdayImport()) return null;
+  // Heisst schon ein Geburtstag so (Hinweis unten), legte "Hinzufuegen" einen
+  // zweiten fuer denselben Menschen an - dann ist "Verknuepfen" der Weg.
+  if (!contact.birthday || contact.suggested_birthday_id || !mayOpenBirthdayImport()) return null;
   return {
     id: 'contact-detail-birthday-add',
     label: t('contacts.addToBirthdays'),
     icon: 'calendar-plus',
     onClick: ({ button } = {}) => addContactToBirthdays(contact, { button, onLinked }),
   };
+}
+
+/**
+ * Der ruhige Hinweis auch im Kontakt (Critique R22, D7): der Geburtstag zeigt
+ * "Ein Kontakt heisst genauso" (birthdays.js, contactSuggestionRow), und
+ * dasselbe Paar steht jetzt auch hier - `suggested_birthday_id` liefert der
+ * Server nur mit Kalender-Leserecht und nur fuer genau einen unverknuepften
+ * Geburtstag dieses Namens. Eine Zeile wie jede andere der Ansicht, mit
+ * "Verknuepfen" als Folgeaktion (dieselben Worte wie dort). Ohne das Recht,
+ * den Geburtstag zu schreiben, gibt es nichts zu tun, also auch keine Zeile.
+ *
+ * @param {object} contact
+ * @param {((loaded: object) => void)|null} onLinked
+ */
+function birthdaySuggestionRow(contact, onLinked = null) {
+  if (!contact.suggested_birthday_id || contact.birthday_id || !mayLinkBirthday()) return null;
+  return {
+    icon: 'cake',
+    label: t('nav.birthdays'),
+    // Gleicher Tag, anderer Name (R23): der Satz nennt den Geburtstag, weil
+    // der Leser ihn sonst nicht wiedererkennt.
+    value: contact.suggested_birthday_name
+      ? t('contacts.birthdaySuggestSameDate', { name: contact.suggested_birthday_name })
+      : t('contacts.birthdaySuggestValue'),
+    action: {
+      id: 'contact-detail-birthday-link',
+      label: t('birthdays.linkContact'),
+      icon: 'link',
+      onClick: ({ button } = {}) => linkContactToBirthday(contact, contact.suggested_birthday_id, { button, onLinked }),
+    },
+  };
+}
+
+/** Darf der Hinweis verknuepfen? `PUT /birthdays/:id` gehoert `calendar`. */
+function mayLinkBirthday() {
+  return !globalThis.window?.yuvomi?.isModuleDisabled?.('birthdays') && mayWritePath('/birthdays');
+}
+
+/**
+ * Verknuepft den gleichnamigen Geburtstag mit diesem Kontakt und laedt den
+ * Kontakt neu - danach traegt die Geburtstagszeile "In Geburtstagen anzeigen"
+ * (samt Datum des Eintrags, wo der Kontakt keins hat), und der Hinweis ist weg.
+ * Wie beim Anlegen zaehlt der neu gelesene Kontakt, nicht die Antwort.
+ *
+ * @returns {Promise<object|null>} der neu geladene Kontakt, oder null
+ */
+async function linkContactToBirthday(contact, birthdayId, { button = null, onLinked = null } = {}) {
+  if (!mayLinkBirthday()) return null;
+  if (button) button.disabled = true;
+  try {
+    await api.put(`/birthdays/${birthdayId}`, { contact_id: contact.id });
+    const loaded = (await api.get(`/contacts/${contact.id}`)).data;
+    if (!loaded?.birthday_id) throw new Error('birthday not linked');
+    const i = state.contacts.findIndex((c) => c.id === contact.id);
+    if (i !== -1) state.contacts[i] = { ...state.contacts[i], birthday_id: loaded.birthday_id };
+    window.yuvomi?.showToast(t('contacts.linkedToBirthday'), 'success');
+    onLinked?.(loaded);
+    return loaded;
+  } catch (err) {
+    if (button?.isConnected) button.disabled = false;
+    window.yuvomi?.showToast(errorSentence(err), 'danger');
+    return null;
+  }
 }
 
 /**
@@ -2269,6 +2374,8 @@ export const __test = {
   birthdayHref,
   // #2149: unverknuepft legt dieselbe Zeile den Geburtstag an.
   addContactToBirthdays,
+  // R22 D7: der Hinweis "Ein Geburtstag heisst genauso" und sein Verknuepfen.
+  linkContactToBirthday,
   // Der Import-Toast und sein Sprung (#1348): die Aussage ist ein Aufruf von
   // `showToast` und ein Flag in der sessionStorage, kein Markup.
   showImportResult, openBirthdayImport,
@@ -2287,4 +2394,6 @@ export const __test = {
   setContainerForTest(container) { _container = container; },
   // R21 S9b: Liste und Detail zeigen eine Nummer gleich.
   enhancePhones,
+  // R22 D20: die Chipreihe und das Mausrad.
+  wireWheelToRow,
 };

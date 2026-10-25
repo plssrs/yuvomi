@@ -18,12 +18,25 @@ import { api } from '/api.js';
 import { clearApiCache } from '/sw-register.js';
 import { t } from '/i18n.js';
 import { esc, REQUIRED_MARK } from '/utils/html.js';
-import { flagField } from '/utils/auth-ui.js';
+import { authHeroHtml, flagField, showAuthError } from '/utils/auth-ui.js';
+import { errorSentence } from '/utils/friendly-error.js';
+
+// Die Laenge des Kopplungscodes (server/services/display-accounts.js CODE_LENGTH).
+const PAIR_CODE_LENGTH = 10;
+
+function wireLinks(container) {
+  container.querySelectorAll('a[data-link]').forEach((a) =>
+    a.addEventListener('click', (e) => { e.preventDefault(); window.yuvomi.navigate(a.getAttribute('href')); }));
+}
 
 export async function render(container) {
   container.replaceChildren();
   container.insertAdjacentHTML('beforeend', `
     <main class="auth-page" id="main-content">
+      ${/* DIE MARKE WIE AUF JEDER AUTH-SEITE (R23 S10, Critique G6 P3
+            "Kopfvarianten"): Einladung und Reset tragen sie ueber der Karte,
+            die Kopplung stand als einzige ohne. */ ''}
+      ${authHeroHtml({ heading: false })}
       <div class="auth-card card card--padded">
         <h1 class="auth-card__title">${esc(t('pairDisplay.title'))}</h1>
         <p class="auth-card__intro">${esc(t('pairDisplay.intro'))}</p>
@@ -34,21 +47,28 @@ export async function render(container) {
                    autocapitalize="characters" autocorrect="off" spellcheck="false"
                    inputmode="text" maxlength="14" />
             <p class="form-hint">${esc(t('pairDisplay.codeHint'))}</p>
+            ${/* DER FEHLER STEHT AM FELD (Critique R22, D19): beide Meldungen
+                  meinen den Code - sie standen als Banner unter dem Formular,
+                  und das Feld selbst zeigte keinen Fehler. */ ''}
+            <div id="pair-error" class="form-error" role="alert" tabindex="-1" hidden></div>
           </div>
           <div class="form-group">
             <label class="form-label" for="pair-label">${esc(t('pairDisplay.labelLabel'))}</label>
             <input class="form-input" type="text" id="pair-label" maxlength="120" />
             <p class="form-hint">${esc(t('pairDisplay.labelHint'))}</p>
           </div>
-          <div id="pair-error" class="form-error" role="alert" hidden></div>
           <button type="submit" class="btn btn--primary auth-form__submit">${esc(t('pairDisplay.submit'))}</button>
         </form>
+        ${/* Der Weg zurueck (D19): wer hier ohne Code landet oder ein
+              Mitglieds-Geraet meint, kam bisher nur ueber die Adresszeile weg. */ ''}
+        <p class="auth-form__forgot"><a href="/login" data-link>${esc(t('forgotPassword.backToLogin'))}</a></p>
       </div>
     </main>
   `);
 
   const form = container.querySelector('#pair-form');
   const errorEl = container.querySelector('#pair-error');
+  wireLinks(container);
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -59,10 +79,15 @@ export async function render(container) {
     // KEINE BROWSER-BLASE (Critique R21): `novalidate`; das leere Pflichtfeld
     // sagt das eine Fehlerfeld der Seite, und das Feld traegt den Bezug.
     if (!code) {
-      flagField(codeEl, errorEl);
-      errorEl.textContent = t('pairDisplay.codeRequired');
-      errorEl.hidden = false;
-      codeEl.focus();
+      showAuthError(errorEl, t('pairDisplay.codeRequired'), codeEl);
+      return;
+    }
+    // DIE LAENGE VOR DEM VERSUCH (R23 S10, Critique G1 P3). Der Code hat zehn
+    // Zeichen (Leerzeichen und Bindestriche zaehlen nicht, wie am Server,
+    // normalizePairingCode). Ein vertippter Code ging bis zum Server und kam
+    // als "gilt nicht" zurueck - und kostete einen der fuenf Versuche.
+    if (code.replace(/[\s-]/g, '').length !== PAIR_CODE_LENGTH) {
+      showAuthError(errorEl, t('pairDisplay.codeLength'), codeEl);
       return;
     }
     const btn = form.querySelector('[type=submit]');
@@ -86,10 +111,15 @@ export async function render(container) {
       window.location.href = '/';
     } catch (err) {
       // Der Server unterscheidet unbekannt, abgelaufen und schon benutzt
-      // bewusst nicht - diese Seite tut es also auch nicht.
-      errorEl.textContent = err.message || t('pairDisplay.failed');
+      // bewusst nicht - diese Seite tut es also auch nicht. Ein 400 ist der
+      // Code; alles andere (Bremse, Netz, Server) ist nicht seine Schuld und
+      // bekommt seinen eigenen Satz - nie den englischen Text des Servers.
+      const codeEl = container.querySelector('#pair-code');
+      if (err?.status === 400) flagField(codeEl, errorEl);
+      errorEl.textContent = err?.status === 400 ? t('pairDisplay.failed') : errorSentence(err);
       errorEl.hidden = false;
       btn.disabled = false;
+      (err?.status === 400 ? codeEl : errorEl).focus();
     }
   });
 }
