@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The dashboard and calendar are fast again with synced recurring events** (#2226). Since the
+  fix for occurrences on the clock change day (#2034), every occurrence of a repeating event is
+  placed in its time zone with several lookups, and each lookup set up a fresh date formatter - the
+  slow part. With a few synced calendars the dashboard took over a second and a half on a fast
+  computer and several seconds on a small server, and it held up every other request in the
+  meantime. Each time zone now keeps one formatter, which makes placing an occurrence about ten
+  times faster. The results are unchanged.
 - **The read and write boxes of a new API token are easy to hit.** Each box only answered on its
   own 14 px square; now the whole cell of its column does, as tall as any other control.
 
